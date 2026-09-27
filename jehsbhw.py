@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v11.7 — фикс застревания меню, AI-проверка везде."""
+"""KiriillBR Playerok Bot v11.8 — фикс застревания меню, AI-проверка везде."""
 import json, logging, os, re, sys, threading, time, urllib.request, base64
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-BOT_VERSION = "11.7"
+BOT_VERSION = "11.8"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -174,6 +174,9 @@ ucache = {}
 _update_check = {"ts": 0, "has": False, "remote": ""}
 DRAFT = jload(DRAFT_FILE, {})
 
+# FIX: храним id последнего сообщения с главным меню, чтобы удалять старое
+LAST_MENU_MSG = {}
+
 def save_draft(): jsave(DRAFT_FILE, DRAFT)
 
 ITEM_STATUS_RU = {
@@ -229,8 +232,10 @@ def send(cid, text, kb=None):
 def notif(text, kb=None):
     if MAIN_ADMIN: send(MAIN_ADMIN, text, kb)
 
+# FIX: переписана функция edit — при неудаче удаляет старое сообщение,
+# чтобы в чате не оставалось "мёртвых" клавиатур со старым меню.
 def edit(cid, mid, text, kb=None):
-    """Безопасное редактирование с fallback на send."""
+    """Безопасное редактирование с fallback на delete+send."""
     try:
         bot.edit_message_text(text, cid, mid, reply_markup=kb, disable_web_page_preview=True)
         return True
@@ -238,13 +243,35 @@ def edit(cid, mid, text, kb=None):
         emsg = str(e).lower()
         # Если ничего не изменилось — не падаем
         if "not modified" in emsg: return True
-        # Если сообщение слишком старое или не редактируется — шлём новое
+        # Не редактируется — удаляем старое, чтобы старая клавиатура не висела
+        try: bot.delete_message(cid, mid)
+        except Exception: pass
         try:
             bot.send_message(cid, text, reply_markup=kb, disable_web_page_preview=True)
             return False
         except Exception as e2:
             L.debug("edit+send fail: %s / %s", e, e2)
             return False
+
+# FIX: показ главного меню с удалением предыдущего
+def _show_main_menu(cid, edit_mid=None):
+    """Показать главное меню: удалить старое, отправить новое, запомнить id."""
+    state.pop(cid, None)
+    old = LAST_MENU_MSG.pop(cid, None)
+    if old and old != edit_mid:
+        try: bot.delete_message(cid, old)
+        except Exception: pass
+    if edit_mid:
+        ok = edit(cid, edit_mid, main_text(), main_kb())
+        if ok:
+            LAST_MENU_MSG[cid] = edit_mid
+            return
+    try:
+        msg = bot.send_message(cid, main_text(), reply_markup=main_kb(),
+                               disable_web_page_preview=True)
+        LAST_MENU_MSG[cid] = msg.message_id
+    except Exception as e:
+        L.debug("_show_main_menu send: %s", e)
 
 def cookies(): return (CREDS.get("cookies") or "").strip()
 def token_pk(): return (CREDS.get("token") or "").strip()
@@ -1082,7 +1109,9 @@ def main_text():
 def cmd_start(m):
     if not adm(m): bot.reply_to(m, "⛔ Нет доступа"); return
     state.pop(m.chat.id, None)
-    bot.send_message(m.chat.id, main_text(), reply_markup=main_kb())
+    DRAFT.pop(str(m.chat.id), None); save_draft()
+    # FIX: используем _show_main_menu — удаляет предыдущее меню
+    _show_main_menu(m.chat.id)
 
 @bot.message_handler(commands=["id"])
 def cmd_id(m): bot.reply_to(m, "🆔 <code>" + str(m.chat.id) + "</code>")
@@ -1127,8 +1156,9 @@ def cb(c):
     a = c.data; cid = c.message.chat.id; mid_ = c.message.id
     try:
         L.info("CB: %r", a)
+        # FIX: главное меню теперь через _show_main_menu — старое удаляется
         if a in ("menu","status","refresh"):
-            edit(cid, mid_, main_text(), main_kb())
+            _show_main_menu(cid, edit_mid=mid_)
         elif a == "conn":
             lines = ["🔌 <b>Подключение</b>", "",
                      "🍪 cookies: <b>" + str(len(cookies())) + "</b>",
@@ -1699,6 +1729,27 @@ def main():
         except Exception as e: L.error("startup: %s", e)
     try: notif("🚀 <b>" + INSTANCE_NAME + "</b> v" + BOT_VERSION)
     except Exception: pass
+
+    # FIX: сбрасываем webhook и ставим актуальный список команд в Telegram,
+    # чтобы не висел старый кеш меню и не мешали старые экземпляры.
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        L.warning("delete_webhook: %s", e)
+    try:
+        bot.set_my_commands([
+            telebot.types.BotCommand("start",  "🏠 Главное меню"),
+            telebot.types.BotCommand("menu",   "🔄 Обновить меню"),
+            telebot.types.BotCommand("id",     "🆔 Мой ID"),
+            telebot.types.BotCommand("cancel", "❌ Отмена"),
+            telebot.types.BotCommand("restart","🔄 Перезапуск"),
+            telebot.types.BotCommand("update", "📥 Обновить бота"),
+            telebot.types.BotCommand("log",    "📄 Лог"),
+        ])
+        L.info("setMyCommands OK")
+    except Exception as e:
+        L.warning("setMyCommands: %s", e)
+
     L.info("telegram polling start")
     try: bot.infinity_polling(timeout=30, long_polling_timeout=30)
     except KeyboardInterrupt:
