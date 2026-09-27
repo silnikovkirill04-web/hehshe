@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v11.0 — создание лотов, ручное обновление."""
+"""KiriillBR Playerok Bot v11.1 — мастер с data_fields, AI-проверка сообщений."""
 import json, logging, os, re, sys, threading, time, urllib.request, base64
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-BOT_VERSION = "11.0"
+BOT_VERSION = "11.1"
 
 # ═══════════════════ ПУТИ ═══════════════════
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -760,7 +760,7 @@ def auto_update_worker():
 
 # ═══════════════════ МАСТЕР СОЗДАНИЯ ЛОТА ═══════════════════
 def draft_start(cid):
-    DRAFT[cid] = {"step": "game"}
+    DRAFT[str(cid)] = {"step": "game"}
     save_draft()
     show_games(cid)
 
@@ -789,21 +789,20 @@ def show_games(cid, force=False, page=0):
 def show_categories(cid, game_id):
     send(cid, "⏳ Загружаю категории...")
     try:
-        gm = acc.get_game(slug=game_id) if not game_id[0].isdigit() else acc.get_game(id=game_id)
-    except Exception:
         try: gm = acc.get_game(slug=game_id)
-        except Exception as e:
-            send(cid, "❌ " + esc(str(e)[:150])); return
+        except Exception: gm = acc.get_game(id=game_id)
+    except Exception as e:
+        send(cid, "❌ " + esc(str(e)[:150])); return
     cats = list(getattr(gm, "categories", []) or [])
     if not cats:
-        send(cid, "❌ Нет категорий в этой игре"); return
+        send(cid, "❌ Нет категорий"); return
     kb = K(row_width=1)
     for c in cats:
         cid_ = str(g(c, "id", default=""))
         nm = sv(g(c, "name"), "?")
         kb.add(B("📁 " + nm[:40], callback_data="cr_cat:" + game_id + "|" + cid_))
     kb.add(B("❌ Отмена", callback_data="cr_cancel"))
-    DRAFT[str(cid)] = {"step": "category", "game_id": game_id}
+    DRAFT[str(cid)] = {"step": "category", "game_id": game_id, "game_slug": getattr(gm, "slug", game_id)}
     save_draft()
     send(cid, "🎮 <b>" + esc(sv(g(gm, "name"), game_id)) + "</b>\n\nВыбери категорию:", kb)
 
@@ -815,36 +814,150 @@ def show_obtaining(cid, game_id, cat_id):
         obts = list(getattr(acc.get_game_category_obtaining_types(cat_id), "obtaining_types", []) or [])
     except Exception:
         obts = []
+    DRAFT[str(cid)] = {
+        "step": "obtaining",
+        "game_id": game_id,
+        "cat_id": cat_id,
+        "cat_name": sv(g(cat, "name"), cat_id),
+    }
+    save_draft()
     if not obts:
-        # если способов нет — сразу к названию
-        DRAFT[str(cid)] = {"step": "name", "game_id": game_id, "cat_id": cat_id, "obt_id": None}
-        save_draft()
-        send(cid, "ℹ️ Способы передачи не требуются.\n\n📝 Пришли <b>название</b> лота:")
+        show_options(cid)
         return
     kb = K(row_width=1)
     for ob in obts:
         oid = str(g(ob, "id", default=""))
         nm = sv(g(ob, "name"), "?")
-        kb.add(B("📦 " + nm[:40], callback_data="cr_obt:" + game_id + "|" + cat_id + "|" + oid))
+        kb.add(B("📦 " + nm[:40], callback_data="cr_obt:" + oid))
     kb.add(B("❌ Отмена", callback_data="cr_cancel"))
-    DRAFT[str(cid)] = {"step": "obtaining", "game_id": game_id, "cat_id": cat_id}
-    save_draft()
     send(cid, "📁 <b>" + esc(sv(g(cat, "name"), cat_id)) + "</b>\n\nСпособ передачи:", kb)
 
-def start_name_input(cid, game_id, cat_id, obt_id):
-    DRAFT[str(cid)] = {"step": "name", "game_id": game_id, "cat_id": cat_id, "obt_id": obt_id}
+def show_options(cid):
+    d = DRAFT.get(str(cid)) or {}
+    cat_id = d.get("cat_id")
+    if not cat_id:
+        send(cid, "❌ Ошибка: нет категории"); return
+    try: cat = acc.get_game_category(cat_id)
+    except Exception as e:
+        send(cid, "❌ " + esc(str(e)[:150])); return
+    opts = list(getattr(cat, "options", []) or [])
+    fields = {}
+    for o in opts:
+        f = str(getattr(o, "field", "?"))
+        fields.setdefault(f, []).append(o)
+    d["options_fields"] = {k: [str(getattr(x, "value", "")) for x in v] for k, v in fields.items()}
+    d["options_map"] = {}
+    for k, v in fields.items():
+        for x in v:
+            d["options_map"][f"{k}={getattr(x, 'value', '')}"] = x
+    d["options_selected"] = {}
+    d["step"] = "options"
     save_draft()
-    send(cid, "📝 Пришли <b>название</b> лота:\n\n/cancel — отмена")
 
-def start_price_input(cid, name):
-    DRAFT[str(cid)]["step"] = "price"
-    DRAFT[str(cid)]["name"] = name
+    if not fields:
+        show_data_fields(cid)
+        return
+    first_field = list(fields.keys())[0]
+    show_options_field(cid, first_field)
+
+def show_options_field(cid, field):
+    d = DRAFT.get(str(cid)) or {}
+    values = d.get("options_fields", {}).get(field, [])
+    kb = K(row_width=2)
+    for v in values[:40]:
+        kb.add(B(v[:30], callback_data=f"cr_opt:{field}={v}"))
+    kb.row(B("⏭ Пропустить", callback_data=f"cr_opt_skip:{field}"),
+           B("❌ Отмена", callback_data="cr_cancel"))
+    d["current_field"] = field
+    save_draft()
+    send(cid, f"⚙️ <b>Опция: {esc(field)}</b>\n\nВыбери значение (" + str(len(values)) + "):", kb)
+
+def next_options_field(cid):
+    d = DRAFT.get(str(cid)) or {}
+    fields = list(d.get("options_fields", {}).keys())
+    selected = d.get("options_selected", {})
+    for f in fields:
+        if f not in selected:
+            show_options_field(cid, f)
+            return
+    show_data_fields(cid)
+
+def show_data_fields(cid):
+    d = DRAFT.get(str(cid)) or {}
+    cat_id = d.get("cat_id"); obt_id = d.get("obt_id")
+    if not cat_id:
+        d["step"] = "name"; save_draft()
+        send(cid, "📝 Пришли <b>название</b> лота:\n\n/cancel — отмена"); return
+    try:
+        df_res = acc.get_game_category_data_fields(cat_id, obt_id) if obt_id else None
+        dfs = list(getattr(df_res, "data_fields", []) or []) if df_res else []
+    except Exception as e:
+        L.warning("get_data_fields: %s", e)
+        dfs = []
+    # Фильтр: только ITEM_DATA (продавец заполняет). OBTAINING_DATA пропускаем.
+    item_fields = []
+    for f in dfs:
+        t = getattr(f, "type", None)
+        tname = str(getattr(t, "name", t) or "").upper()
+        if "ITEM_DATA" in tname:
+            item_fields.append(f)
+    if not item_fields:
+        d["data_fields_filled"] = []
+        d["step"] = "name"
+        save_draft()
+        send(cid, "ℹ️ Обязательных полей данных нет.\n\n📝 Пришли <b>название</b> лота:\n\n/cancel — отмена")
+        return
+    d["data_fields_list"] = []
+    for f in item_fields:
+        t = getattr(f, "type", None)
+        d["data_fields_list"].append({
+            "id": str(getattr(f, "id", "")),
+            "label": str(getattr(f, "label", "Поле")),
+            "required": bool(getattr(f, "required", False)),
+            "value": None,
+        })
+    d["data_fields_filled"] = []
+    d["step"] = "data_field"
+    save_draft()
+    show_data_field(cid, 0)
+
+def show_data_field(cid, idx):
+    d = DRAFT.get(str(cid)) or {}
+    lst = d.get("data_fields_list", [])
+    if idx >= len(lst):
+        d["step"] = "name"
+        save_draft()
+        send(cid, "✅ Данные заполнены.\n\n📝 Пришли <b>название</b> лота:\n\n/cancel — отмена")
+        return
+    f = lst[idx]
+    d["current_df_idx"] = idx
+    save_draft()
+    req = "⚠️ ОБЯЗАТЕЛЬНОЕ" if f["required"] else "(необязательное)"
+    txt = (f"📋 <b>Поле {idx+1}/{len(lst)}: {esc(f['label'])}</b>\n"
+           f"{req}\n\n"
+           f"Пришли значение:")
+    kb = K(row_width=1)
+    if not f["required"]:
+        kb.add(B("⏭ Пропустить", callback_data="cr_df_skip"))
+    kb.add(B("❌ Отмена", callback_data="cr_cancel"))
+    send(cid, txt, kb)
+
+def next_data_field(cid):
+    d = DRAFT.get(str(cid)) or {}
+    idx = d.get("current_df_idx", 0)
+    show_data_field(cid, idx + 1)
+
+def start_name_input(cid, name):
+    d = DRAFT.get(str(cid)) or {}
+    d["name"] = name
+    d["step"] = "price"
     save_draft()
     send(cid, "💰 Пришли <b>цену</b> (число):\n\n/cancel — отмена")
 
-def start_desc_input(cid, price):
-    DRAFT[str(cid)]["step"] = "description"
-    DRAFT[str(cid)]["price"] = price
+def start_price_input(cid, price):
+    d = DRAFT.get(str(cid)) or {}
+    d["price"] = price
+    d["step"] = "description"
     save_draft()
     send(cid, "📄 Пришли <b>описание</b>:\n\n/cancel — отмена")
 
@@ -852,42 +965,72 @@ def finalize_draft(cid, desc):
     d = DRAFT.get(str(cid)) or {}
     d["description"] = desc
     save_draft()
-    # Проверка
+
     ok_n, hits_n = validate_text(d.get("name", ""))
     ok_d, hits_d = validate_text(desc)
     if not ok_n or not ok_d:
         hits = list(dict.fromkeys(hits_n + hits_d))
         send(cid, "⚠️ <b>Заблокировано</b>\n\n" + ", ".join(hits) + "\n\nПопробуй /start и создай заново")
         DRAFT.pop(str(cid), None); save_draft(); return
-    # Создаём
+
     send(cid, "⏳ Создаю лот...")
     def _create():
         try:
+            cat_id = d["cat_id"]
+            selected_opts = []
+            opt_map = d.get("options_map", {})
+            for k, v in (d.get("options_selected") or {}).items():
+                key = f"{k}={v}"
+                if key in opt_map:
+                    selected_opts.append(opt_map[key])
+            # data_fields
+            df_payload = []
+            for item in (d.get("data_fields_filled") or []):
+                df_payload.append({"id": item["id"], "value": item["value"]})
             kw = {
-                "game_category_id": d["cat_id"],
+                "game_category_id": cat_id,
                 "name": d["name"],
                 "price": int(d["price"]),
                 "description": legal_wrap(d["description"]),
-                "options": [],
-                "data_fields": [],
+                "options": selected_opts,
+                "data_fields": df_payload,
                 "attachments": [],
             }
             if d.get("obt_id"):
                 kw["obtaining_type_id"] = d["obt_id"]
             try:
                 it = acc.create_item(**kw)
-            except TypeError:
-                # если obtaining_type_id не требуется
+            except TypeError as e:
+                L.warning("create_item TypeError: %s", e)
                 kw.pop("obtaining_type_id", None)
                 it = acc.create_item(**kw)
+
             iid = str(g(it, "id", default=""))
+            L.info("created item: %s", iid)
             DRAFT.pop(str(cid), None); save_draft()
             send(cid, "✅ <b>Лот создан!</b>\n🆔 <code>" + esc(iid) + "</code>")
+
+            # Публикация
+            try:
+                sts = acc.get_item_priority_statuses(iid, int(d["price"]))
+                free = None
+                for s in (getattr(sts, "statuses", None) or getattr(sts, "priority_statuses", None) or []):
+                    try:
+                        if int(getattr(s, "price", -1)) == 0: free = s; break
+                    except Exception: pass
+                if free:
+                    acc.publish_item(iid, free.id)
+                    send(cid, "📤 Опубликован (бесплатный статус)")
+                else:
+                    send(cid, "⚠️ Бесплатный статус не найден — публикуй вручную")
+            except Exception as e:
+                L.warning("publish: %s", e)
+                send(cid, "⚠️ Публикация: " + esc(str(e)[:150]))
             try: show_item(cid, iid)
             except Exception: pass
         except Exception as e:
             L.exception("create_item")
-            send(cid, "❌ Ошибка: <code>" + esc(str(e)[:300]) + "</code>")
+            send(cid, "❌ Ошибка: <code>" + esc(str(e)[:400]) + "</code>")
     threading.Thread(target=_create, daemon=True).start()
 
 # ═══════════════════ UI ═══════════════════
@@ -1085,7 +1228,7 @@ def cb(c):
         draft_start(cid)
     elif a == "cr_cancel":
         DRAFT.pop(str(cid), None); save_draft()
-        edit(cid, mid_, "❌ Создание отменено", K().add(B("◀️", callback_data="menu")))
+        edit(cid, mid_, "❌ Отменено", K().add(B("◀️", callback_data="menu")))
     elif a == "cr_games_r":
         show_games(cid, force=True)
     elif a.startswith("cr_games_p:"):
@@ -1098,13 +1241,35 @@ def cb(c):
     elif a.startswith("cr_cat:"):
         _, rest = a.split(":", 1)
         parts = rest.split("|", 1)
-        if len(parts) == 2:
-            show_obtaining(cid, parts[0], parts[1])
+        if len(parts) == 2: show_obtaining(cid, parts[0], parts[1])
     elif a.startswith("cr_obt:"):
-        _, rest = a.split(":", 1)
-        parts = rest.split("|")
-        if len(parts) == 3:
-            start_name_input(cid, parts[0], parts[1], parts[2])
+        oid = a[7:]
+        d = DRAFT.get(str(cid)) or {}
+        d["obt_id"] = oid
+        save_draft()
+        show_options(cid)
+    elif a.startswith("cr_opt_skip:"):
+        f = a[12:]
+        d = DRAFT.get(str(cid)) or {}
+        d.setdefault("options_selected", {})
+        save_draft()
+        next_options_field(cid)
+    elif a.startswith("cr_opt:"):
+        rest = a[7:]
+        if "=" in rest:
+            field, val = rest.split("=", 1)
+            d = DRAFT.get(str(cid)) or {}
+            d.setdefault("options_selected", {})[field] = val
+            save_draft()
+            next_options_field(cid)
+    elif a == "cr_df_skip":
+        d = DRAFT.get(str(cid)) or {}
+        idx = d.get("current_df_idx", 0)
+        lst = d.get("data_fields_list", [])
+        if idx < len(lst):
+            lst[idx]["value"] = None
+        save_draft()
+        next_data_field(cid)
     # ─── ЛОТЫ ───
     elif a == "items" or a.startswith("items:"):
         try: off = int(a.split(":")[1]) if ":" in a else 0
@@ -1302,14 +1467,24 @@ def handle_text(m):
         if text.lower() in ("/cancel", "отмена"):
             DRAFT.pop(str(m.chat.id), None); save_draft()
             bot.reply_to(m, "❌ Отменено"); return
+        if step == "data_field":
+            idx = d.get("current_df_idx", 0)
+            lst = d.get("data_fields_list", [])
+            if idx < len(lst):
+                lst[idx]["value"] = text
+                if "data_fields_filled" not in d:
+                    d["data_fields_filled"] = []
+                d["data_fields_filled"].append({"id": lst[idx]["id"], "value": text})
+            save_draft()
+            next_data_field(m.chat.id); return
         if step == "name":
             okv, msg = guard_text(text, "названии")
             if not okv: bot.reply_to(m, msg); return
-            start_price_input(m.chat.id, text); return
+            start_name_input(m.chat.id, text); return
         if step == "price":
-            try: p = int(float(text.replace(",", ".")))
+            try: pp = int(float(text.replace(",", ".")))
             except Exception: bot.reply_to(m, "❌ Число"); return
-            start_desc_input(m.chat.id, p); return
+            start_price_input(m.chat.id, pp); return
         if step == "description":
             finalize_draft(m.chat.id, text); return
 
@@ -1337,13 +1512,22 @@ def handle_text(m):
             else: bot.send_message(m.chat.id, "⚠️ " + esc(r[:500]))
         threading.Thread(target=_t, daemon=True).start()
     elif a == "reply":
-        state.pop(m.chat.id, None); cid = st.get("chat"); text = (m.text or "").strip()
+        state.pop(m.chat.id, None); cid_chat = st.get("chat"); text = (m.text or "").strip()
         if not text: return
         okv, msg = guard_text(text, "сообщении")
         if not okv: bot.reply_to(m, msg); return
-        try:
-            acc.send_message(chat_id=cid, text=text); bot.reply_to(m, "✅")
-        except Exception as e: bot.reply_to(m, "❌ " + esc(str(e)[:200]))
+        bot.reply_to(m, "🔍 Проверяю AI...")
+        def _rc():
+            ok_ai, reason = ai_check_text(text)
+            if not ok_ai:
+                bot.send_message(m.chat.id, "⚠️ <b>AI-проверка не пропустила:</b>\n\n" + esc(reason[:500]))
+                return
+            try:
+                acc.send_message(chat_id=cid_chat, text=text)
+                bot.send_message(m.chat.id, "✅ Отправлено")
+            except Exception as e:
+                bot.send_message(m.chat.id, "❌ " + esc(str(e)[:200]))
+        threading.Thread(target=_rc, daemon=True).start()
     elif a == "edprice":
         state.pop(m.chat.id, None); iid = st.get("id")
         try: p = int(float((m.text or "").strip().replace(",", ".")))
