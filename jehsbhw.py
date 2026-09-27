@@ -1,44 +1,101 @@
-#!/usr/bin/env python3
+.#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v10.1 — мультиинстанс + автообновление."""
-import json, logging, os, re, sys, threading, time, urllib.request, subprocess
+"""KiriillBR Playerok Bot v10.2 — стабильная версия."""
+import json, logging, os, re, sys, threading, time, urllib.request, subprocess, base64
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-BOT_VERSION = "10.1"
+BOT_VERSION = "10.2"
 
-# ═══════════════════ МУЛЬТИИНСТАНС ═══════════════════
+# ═══════════════════ ПУТИ ═══════════════════
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-INSTANCE_FILE = os.path.join(BASE_DIR, ".instance")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
-def get_instance():
-    env = os.environ.get("INSTANCE")
-    if env: return env
-    if os.path.exists(INSTANCE_FILE):
-        try:
-            with open(INSTANCE_FILE, encoding="utf-8") as f:
-                n = f.read().strip()
-            if n: return n
-        except Exception: pass
-    return None
+def jload(p, d):
+    try:
+        with open(p, encoding="utf-8") as f: return json.load(f)
+    except Exception: return d
 
-def set_instance(nick):
-    nick = re.sub(r"[^A-Za-z0-9_\-]", "_", str(nick))[:32]
-    if not nick: raise ValueError("Пустой ник")
-    with open(INSTANCE_FILE, "w", encoding="utf-8") as f: f.write(nick)
-    os.makedirs(os.path.join(BASE_DIR, nick), exist_ok=True)
-    return nick
+def jsave(p, d):
+    try:
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2, default=str)
+            f.flush()
+            try: os.fsync(f.fileno())
+            except Exception: pass
+        os.replace(tmp, p)
+    except Exception as e:
+        print("save", p, e)
 
-def instance_dir():
-    n = get_instance()
-    return os.path.join(BASE_DIR, n) if n else BASE_DIR
+def setup_logging():
+    root = logging.getLogger(); root.setLevel(logging.DEBUG)
+    for h in list(root.handlers): root.removeHandler(h)
+    fmt = logging.Formatter("%(asctime)s,%(msecs)03d [%(levelname)-5s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+    ch = logging.StreamHandler(sys.stdout); ch.setLevel(logging.INFO); ch.setFormatter(fmt); root.addHandler(ch)
+    for n in ("urllib3","requests","curl_cffi","telebot","playerokapi","charset_normalizer"):
+        logging.getLogger(n).setLevel(logging.WARNING)
 
-INST_DIR = instance_dir()
+setup_logging()
+L = logging.getLogger("Bot")
+
+# ═══════════════════ КОНФИГ ═══════════════════
+def load_cfg():
+    return jload(CONFIG_FILE, {})
+
+def save_cfg(c):
+    jsave(CONFIG_FILE, c)
+
+def setup_wizard():
+    print("=" * 60)
+    print("  Первый запуск KiriillBR Playerok Bot")
+    print("=" * 60)
+    print()
+    while True:
+        nick = input("Ник бота (латиница/цифры/_-): ").strip()
+        nick = re.sub(r"[^A-Za-z0-9_\-]", "_", nick)[:32]
+        if not nick:
+            print("Пустой — ещё раз"); continue
+        break
+    cfg = {"instance": nick}
+    cfg["token"] = input("1. Токен бота: ").strip()
+    cfg["admin_password"] = input("2. Пароль для входа: ").strip()
+    try:
+        cfg["admin_id"] = int(input("3. Telegram ID (у @userinfobot): ").strip())
+    except ValueError:
+        cfg["admin_id"] = 0
+    cfg["proxy"] = input("4. Прокси [Enter=нет]: ").strip()
+    cfg["github_repo"] = input("5. GitHub owner/repo [Enter=silnikovkirill04-web/hehshe]: ").strip() or "silnikovkirill04-web/hehshe"
+    cfg["github_branch"] = "main"
+    cfg["github_file"] = "jehsbhw.py"
+    cfg["auto_update"] = True
+    cfg["tmpl"] = "Здравствуйте, {buyer}! {message}"
+    save_cfg(cfg)
+    print()
+    print("✅ Сохранено:", CONFIG_FILE)
+    print("📁 Инстанс:", os.path.join(BASE_DIR, nick))
+    print()
+    return cfg
+
+CFG = load_cfg()
+if not CFG.get("token") or not CFG.get("admin_password") or not CFG.get("instance"):
+    CFG = setup_wizard()
+
+TOKEN = CFG["token"]
+ADMIN_PASSWORD = CFG.get("admin_password", "")
+MAIN_ADMIN = int(CFG.get("admin_id") or 0)
+PROXY = CFG.get("proxy", "")
+GITHUB_REPO = CFG.get("github_repo", "")
+GITHUB_BRANCH = CFG.get("github_branch", "main")
+GITHUB_FILE = CFG.get("github_file", "jehsbhw.py")
+INSTANCE_NAME = CFG.get("instance", "default")
+
+# Папка инстанса
+INST_DIR = os.path.join(BASE_DIR, INSTANCE_NAME)
 os.makedirs(INST_DIR, exist_ok=True)
 
-CONFIG_FILE   = os.path.join(INST_DIR, "config.json")
 CREDS_FILE    = os.path.join(INST_DIR, "creds.json")
 SETTINGS_FILE = os.path.join(INST_DIR, "settings.json")
 DEALS_FILE    = os.path.join(INST_DIR, "deals.json")
@@ -51,89 +108,19 @@ SEEN_FILE     = os.path.join(INST_DIR, "seen.json")
 LOG_FILE      = os.path.join(INST_DIR, "bot.log")
 os.makedirs(PLUGINS_DIR, exist_ok=True)
 
-# ═══════════════════ ЛОГИ ═══════════════════
-def setup_logging():
-    root = logging.getLogger(); root.setLevel(logging.DEBUG)
-    for h in list(root.handlers): root.removeHandler(h)
-    fmt = logging.Formatter("%(asctime)s,%(msecs)03d [%(levelname)-5s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
-    ch = logging.StreamHandler(sys.stdout); ch.setLevel(logging.INFO); ch.setFormatter(fmt); root.addHandler(ch)
-    try:
-        fh = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=5, encoding="utf-8")
-        fh.setLevel(logging.DEBUG); fh.setFormatter(fmt); root.addHandler(fh)
-    except Exception as e: print("log:", e)
-    for n in ("urllib3","requests","curl_cffi","telebot","playerokapi","charset_normalizer"):
-        logging.getLogger(n).setLevel(logging.WARNING)
-
-setup_logging()
-L = logging.getLogger("Bot")
-
-# ═══════════════════ JSON ═══════════════════
-def jload(p, d):
-    try:
-        with open(p, encoding="utf-8") as f: return json.load(f)
-    except Exception: return d
-
-def jsave(p, d):
-    try:
-        with open(p + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2, default=str)
-        os.replace(p + ".tmp", p)
-    except Exception as e: L.error("save %s: %s", p, e)
-
-def save_config(c): jsave(CONFIG_FILE, c)
-
-# ═══════════════════ ВИЗАРД ═══════════════════
-def setup_wizard():
-    global INST_DIR, CONFIG_FILE
-    print("=" * 60); print("  Первый запуск KiriillBR Playerok Bot"); print("=" * 60); print()
-    while True:
-        nick = input("Придумай ник для бота (латиница/цифры/_-): ").strip()
-        if not nick: print("Пустой — ещё раз"); continue
-        try: nick = set_instance(nick); break
-        except Exception as e: print("Ошибка:", e)
-    INST_DIR = instance_dir()
-    CONFIG_FILE = os.path.join(INST_DIR, "config.json")
-    print(); print("📁 Инстанс:", nick); print("📁 Папка:  ", INST_DIR); print()
-    cfg = {"instance": nick}
-    cfg["token"] = input("1. Токен бота (от @BotFather): ").strip()
-    cfg["admin_password"] = input("2. Пароль для входа: ").strip()
-    try: cfg["admin_id"] = int(input("3. Твой Telegram ID (у @userinfobot): ").strip())
-    except ValueError: cfg["admin_id"] = 0
-    cfg["proxy"] = input("4. Прокси (SOCKS5/HTTP) [Enter=нет]: ").strip()
-    cfg["github_repo"] = input("5. GitHub owner/repo [Enter=silnikovkirill04-web/hehshe]: ").strip() or "silnikovkirill04-web/hehshe"
-    cfg["github_branch"] = "main"
-    cfg["github_file"] = "jehsbhw.py"
-    cfg["notify_messages"] = True
-    cfg["notify_deals"] = True
-    cfg["auto_confirm"] = False
-    cfg["auto_confirm_delay"] = 30
-    cfg["auto_bump"] = False
-    cfg["auto_bump_min"] = 240
-    cfg["auto_bump_max"] = 100
-    cfg["auto_update"] = True
-    cfg["tmpl"] = "Здравствуйте, {buyer}! {message}"
-    save_config(cfg)
-    print(); print("=" * 60); print("  ✅ Сохранено в:", CONFIG_FILE); print("=" * 60); print()
-    return cfg
-
-CFG = jload(CONFIG_FILE, {})
-if not CFG.get("token") or not CFG.get("admin_password"):
-    CFG = setup_wizard()
-
-TOKEN = CFG["token"]
-ADMIN_PASSWORD = CFG.get("admin_password", "")
-MAIN_ADMIN = int(CFG.get("admin_id") or 0)
-PROXY = CFG.get("proxy", "")
-GITHUB_REPO = CFG.get("github_repo", "")
-GITHUB_BRANCH = CFG.get("github_branch", "main")
-GITHUB_FILE = CFG.get("github_file", "jehsbhw.py")
-INSTANCE_NAME = CFG.get("instance", "default")
+# Лог в файл
+try:
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=5, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s,%(msecs)03d [%(levelname)-5s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S"))
+    logging.getLogger().addHandler(fh)
+except Exception as e:
+    print("log file:", e)
 
 if PROXY:
     try:
         telebot.apihelper.proxy = {"http": PROXY, "https": PROXY}
-        L.info("Telegram proxy: %s", PROXY)
-    except Exception as e: L.warning("proxy: %s", e)
+    except Exception: pass
 
 # ═══════════════════ ХРАНИЛИЩА ═══════════════════
 CREDS = jload(CREDS_FILE, {"cookies": "", "token": "", "ddg5": ""})
@@ -141,11 +128,15 @@ SET_D = jload(SETTINGS_FILE, {
     "notify_messages": True, "notify_deals": True,
     "auto_confirm": False, "auto_confirm_delay": 30,
     "auto_bump": False, "auto_bump_min": 240, "auto_bump_max": 100,
-    "auto_update": True,
-    "tmpl": "Здравствуйте, {buyer}! {message}",
+    "auto_update": True, "tmpl": "Здравствуйте, {buyer}! {message}",
 })
 DEALS_D = jload(DEALS_FILE, {})
 USERS_STATE = jload(USERS_FILE, {"authorized": []})
+# Авто-авторизация главного админа
+if MAIN_ADMIN and MAIN_ADMIN not in USERS_STATE.get("authorized", []):
+    USERS_STATE.setdefault("authorized", []).append(MAIN_ADMIN)
+    jsave(USERS_FILE, USERS_STATE)
+
 AI_CONFIG = jload(AI_FILE, {"enabled": False, "provider": "gemini", "api_key": "", "model": "", "strict": True})
 NAMES_D = jload(NAMES_FILE, {})
 PLUGS_D = jload(PLUGINS_FILE, {})
@@ -158,7 +149,14 @@ def save_users(): jsave(USERS_FILE, USERS_STATE)
 def save_ai(): jsave(AI_FILE, AI_CONFIG)
 def save_names(): jsave(NAMES_FILE, NAMES_D)
 def save_plugs(): jsave(PLUGINS_FILE, PLUGS_D)
-def save_seen(): jsave(SEEN_FILE, SEEN_D)
+
+def save_seen():
+    try:
+        m = list(seen_m)[-5000:]
+        d = list(seen_d)[-5000:]
+        jsave(SEEN_FILE, {"msgs": m, "deals": d})
+    except Exception as e:
+        L.warning("save_seen: %s", e)
 
 # ═══════════════════ СЛУЖЕБНЫЕ ЧАТЫ ═══════════════════
 SUPPORT_IDS = {"1f1b989c-c8ff-62c2-61ae-6f0b6ec96725": "🆘 Поддержка"}
@@ -186,7 +184,8 @@ try:
     from playerokapi.exceptions import BotCheckDetectedException as BotCheck, UnauthorizedError as Unauth
     OK = True
     L.info("playerokapi OK")
-except Exception as e: L.error("playerokapi: %s", e)
+except Exception as e:
+    L.error("playerokapi: %s", e)
 
 # ═══════════════════ STATE ═══════════════════
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
@@ -196,8 +195,8 @@ state = {}
 cache = {"chats": [], "ts": 0}
 conn = {"ok": False, "err": "", "method": ""}
 profile = {}
-seen_m = set(SEEN_D.get("m") or [])
-seen_d = set(SEEN_D.get("d") or []) | set(DEALS_D.keys())
+seen_m = set(SEEN_D.get("msgs") or [])
+seen_d = set(SEEN_D.get("deals") or []) | set(DEALS_D.keys())
 last_bump = {"ts": 0}
 plugin_apis = {}
 ucache = {}
@@ -250,6 +249,122 @@ def cookie_str():
         x = x.strip()
         if x and x not in p: p.append(x)
     return ";".join(p)
+
+# ═══════════════════ ФОТО / URL — МНОГО СПОСОБОВ ═══════════════════
+def _to_url(x):
+    """Универсальная функция — превращает что угодно в URL."""
+    if x is None: return ""
+    if isinstance(x, str):
+        s = x.strip()
+        if not s: return ""
+        if s.startswith("http"): return s
+        if s.startswith("//"): return "https:" + s
+        if s.startswith("/"): return "https://playerok.com" + s
+        if "." in s and " " not in s and len(s) < 300: return "https://playerok.com/" + s
+        return ""
+    if isinstance(x, bytes):
+        return ""
+    if isinstance(x, dict):
+        for k in ("url","link","href","src","path","file_url","fileUrl","preview_url","previewUrl","image_url","imageUrl","download_url","downloadUrl","cdn_url","cdnUrl"):
+            u = _to_url(x.get(k))
+            if u: return u
+        for v in x.values():
+            u = _to_url(v)
+            if u: return u
+    if isinstance(x, (list, tuple)):
+        for y in x:
+            u = _to_url(y)
+            if u: return u
+    # Прямые атрибуты (FileObject)
+    for attr in ("url","link","href","src","path","file_url","fileUrl","preview_url","previewUrl","image_url","imageUrl","download_url","downloadUrl","cdn_url","cdnUrl"):
+        try:
+            v = getattr(x, attr, None)
+            u = _to_url(v)
+            if u: return u
+        except Exception: continue
+    # __dict__
+    try:
+        d = vars(x)
+        for k, v in d.items():
+            if isinstance(v, str) and v.startswith("http"): return v
+        for k, v in d.items():
+            u = _to_url(v)
+            if u: return u
+    except Exception: pass
+    # __slots__
+    try:
+        for slot in getattr(x, "__slots__", []) or []:
+            v = getattr(x, slot, None)
+            u = _to_url(v)
+            if u: return u
+    except Exception: pass
+    # str / repr
+    try:
+        s = str(x)
+        m = re.search(r"https?://[^\s\"'<>]+", s)
+        if m: return m.group(0)
+    except Exception: pass
+    try:
+        s = repr(x)
+        m = re.search(r"https?://[^\s\"'<>]+", s)
+        if m: return m.group(0)
+    except Exception: pass
+    return ""
+
+def item_photos(it):
+    """Возвращает СПИСОК URL фото лота. Пробует очень много полей."""
+    out = []
+    seen = set()
+    def add(u):
+        u = _to_url(u)
+        if u and u not in seen:
+            seen.add(u); out.append(u)
+    # 1) Прямые поля
+    for f in ("attachment","attachments","images","photos","files","banner","image",
+              "preview","thumbnail","picture","cover","main_image","photo",
+              "media","gallery","screenshots","banners","pics","imgs",
+              "image_url","imageUrl","photo_url","photoUrl","thumbnail_url"):
+        v = g(it, f)
+        if v: add(v)
+    # 2) raw / _raw / data / _data
+    for ra in ("raw","_raw","data","_data","json","_json","payload","_payload"):
+        try: raw = getattr(it, ra, None)
+        except Exception: raw = None
+        if raw is None and isinstance(it, dict): raw = it.get(ra)
+        if isinstance(raw, (dict, list)):
+            add(raw)
+    # 3) __dict__
+    try:
+        for k, v in vars(it).items():
+            kl = str(k).lower()
+            if any(t in kl for t in ("attach","image","photo","banner","pic","cover","preview","thumb","media")):
+                add(v)
+    except Exception: pass
+    # 4) если it — dict
+    if isinstance(it, dict):
+        for k, v in it.items():
+            kl = str(k).lower()
+            if any(t in kl for t in ("attach","image","photo","banner","pic","cover","preview","thumb","media")):
+                add(v)
+    return out
+
+def item_url(iid, it=None):
+    """Правильный URL лота на Playerok."""
+    if it:
+        for k in ("url","link","href","permalink","web_url","webUrl"):
+            v = g(it, k)
+            if v and isinstance(v, str) and v.strip():
+                u = _to_url(v)
+                if u: return u
+        s = g(it, "slug")
+        if s and isinstance(s, str) and s.strip():
+            s = s.strip()
+            if s.startswith("http"): return s
+            if s.startswith("products/"): return "https://playerok.com/" + s
+            return "https://playerok.com/products/" + s
+    if iid:
+        return "https://playerok.com/products/" + str(iid)
+    return "https://playerok.com/"
 
 # ═══════════════════ PLAYEROK API ═══════════════════
 def get_chats():
@@ -384,11 +499,18 @@ def my_msg(m, chat=None):
     return False
 
 def mid(m):
-    for f in ("id","message_id","uid"):
+    """Много способов получить ID сообщения."""
+    for f in ("id","message_id","msg_id","uid"):
         v = g(m, f)
         if v: return str(v)
-    t = mtext(m); ts = mts(m)
-    if t or ts: return "h%d:%s" % (hash(t), ts)
+    try:
+        raw = getattr(m, "raw", None) or getattr(m, "_raw", None)
+        if isinstance(raw, dict):
+            for f in ("id","message_id","uid"):
+                if raw.get(f): return str(raw[f])
+    except Exception: pass
+    t = mtext(m); ts = mts(m); au = sender_id(None, m)
+    if t or ts: return "h%d:%s:%s" % (hash(t), ts, au)
     return ""
 
 # ═══════════════════ AI ═══════════════════
@@ -412,7 +534,7 @@ AI_PROMPT = """Проверь изображение на нарушения п�
 6. Оформление: имитация офиц. магазина Playerok, мат, оскорбления, политика, экстремизм
 7. Недостоверность: случайная игра, рандом, от 1 до 10, прайс-лист, каталог, бартер, обмен
 
-РАЗРЕШЕНО: игровые скриншоты, логотипы игр, стикеры/эмодзи, молния ⚡, 🔥, ⭐, 🎮, 💰, персонажи аниме/игр, инструкции, "гарантия 48 часов" и больше, "быстро", "premium", цены
+РАЗРЕШЕНО: игровые скриншоты, логотипы игр, стикеры/эмодзи, молния ⚡, 🔥, ⭐, 🎮, 💰, персонажи аниме/игр, инструкции, "гарантия 48 часов" и больше
 
 ОТВЕТ: строго OK или BAD: <список>"""
 
@@ -442,7 +564,6 @@ def ai_check_image(data, mime="image/jpeg"):
     if not AI_CONFIG.get("enabled"): return True, ""
     key = (AI_CONFIG.get("api_key") or "").strip()
     if not key: return True, ""
-    import base64
     b64 = base64.b64encode(data).decode()
     prov = (AI_CONFIG.get("provider") or "gemini").lower()
     def _b(model, kind):
@@ -451,8 +572,7 @@ def ai_check_image(data, mime="image/jpeg"):
                 {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
                 {"type": "text", "text": AI_PROMPT}]}]}
         if kind == "gemini":
-            return {"contents": [{"parts": [{"text": AI_PROMPT},
-                {"inline_data": {"mime_type": mime, "data": b64}}]}]}
+            return {"contents": [{"parts": [{"text": AI_PROMPT}, {"inline_data": {"mime_type": mime, "data": b64}}]}]}
         return {"model": model, "max_tokens": 300, "messages": [{"role": "user", "content": [
             {"type": "text", "text": AI_PROMPT},
             {"type": "image_url", "image_url": {"url": "data:" + mime + ";base64," + b64}}]}]}
@@ -471,9 +591,7 @@ def ai_check_text(text):
     key = (AI_CONFIG.get("api_key") or "").strip()
     if not key: return True, ""
     prov = (AI_CONFIG.get("provider") or "gemini").lower()
-    p = ("Проверь текст на нарушения правил Playerok. ЗАПРЕЩЕНО: контакты, обход комиссии, "
-         "гарантии (кроме 48 часов и больше), читы, VPN, tdata, крипта, казино, 18+, пиратство, "
-         "мат, имитация офиц. магазина, бартер, прайс-лист. Ответь OK или BAD: список. ТЕКСТ: " + text[:3000])
+    p = ("Проверь текст на нарушения правил Playerok. ЗАПРЕЩЕНО: контакты, обход комиссии, гарантии (кроме 48 часов и больше), читы, VPN, tdata, крипта, казино, 18+, пиратство, мат. Ответь OK или BAD: список. ТЕКСТ: " + text[:3000])
     def _b(model, kind):
         if kind == "anthropic": return {"model": model, "max_tokens": 200, "messages": [{"role": "user", "content": p}]}
         if kind == "gemini": return {"contents": [{"parts": [{"text": p}]}]}
@@ -498,8 +616,6 @@ def guard_photo(data, mime="image/jpeg", label="фото"):
     return True, ""
 
 # ═══════════════════ ЗАЩИТА ТЕКСТА ═══════════════════
-import re as _reg
-
 BANNED_PATTERNS = [
     (r"\+?\d[\d\s\-()]{9,}", "телефон"),
     (r"\b[\w.+-]+@[\w-]+\.[\w.-]+", "email"),
@@ -534,11 +650,11 @@ def validate_text(text):
     t = str(text).lower(); hits = []
     for pat, name in BANNED_PATTERNS:
         try:
-            if _reg.search(pat, t, _reg.IGNORECASE | _reg.UNICODE): hits.append(name)
+            if re.search(pat, t, re.IGNORECASE | re.UNICODE): hits.append(name)
         except Exception: continue
     if "гарантия" in hits:
-        allowed = _reg.search(r"гарант\w*\s+(?:на\s+)?(\d{2,}|48|72|90|180|365)\s*(?:час|ч|дн|дней|мес|год)", t)
-        if allowed and not _reg.search(r"пожизн|навсегда|вечн|бессрочн|100%", t):
+        allowed = re.search(r"гарант\w*\s+(?:на\s+)?(\d{2,}|48|72|90|180|365)\s*(?:час|ч|дн|дней|мес|год)", t)
+        if allowed and not re.search(r"пожизн|навсегда|вечн|бессрочн|100%", t):
             hits = [h for h in hits if h != "гарантия"]
     return len(hits) == 0, hits
 
@@ -548,7 +664,6 @@ def guard_text(text, label="текст"):
     uniq = list(dict.fromkeys(hits))
     return False, ("⚠️ <b>Заблокировано правилами</b>\n\nВ " + label + ": <b>" + ", ".join(uniq) + "</b>\n\nПравила: playerok.com/terms-of-sale")
 
-# ═══════════════════ LEGAL ═══════════════════
 LEGAL_FOOTER = ("\n\n━━━━━━━━━━━━━━━━━━\nУсловия продажи: playerok.com/terms-of-sale\n"
                 "Пользовательское соглашение: playerok.com/agreement\n"
                 "Политика конфиденциальности: playerok.com/privacy\n"
@@ -612,13 +727,14 @@ def poller():
                 did = str(g(d, "id", "deal_id") or "")
                 if did and did not in seen_d:
                     seen_d.add(did); on_deal(d)
+            new_msgs = 0
             for ch in (cache.get("chats") or [])[:20]:
                 cid = g(ch, "id", "chat_id")
                 if not cid: continue
                 for m in get_msgs(cid)[-8:]:
                     i = mid(m)
                     if not i or i in seen_m: continue
-                    seen_m.add(i)
+                    seen_m.add(i); new_msgs += 1
                     if my_msg(m, ch): continue
                     nm = sender_name(ch, m); txt = mtext(m)
                     if not txt: continue
@@ -626,9 +742,10 @@ def poller():
                     if SET_D.get("notify_messages", True):
                         kb = K(row_width=2).row(B("📜 15", callback_data="c:" + str(cid)), B("✍️ Ответ", callback_data="r:" + str(cid)))
                         notif("💬 <b>" + esc(nm) + "</b>\n" + esc(txt[:400]), kb)
+            if new_msgs:
+                save_seen()
             try: refresh_profile()
             except Exception: pass
-            save_seen()
             conn["ok"] = True
         except Exception as e:
             conn["ok"] = False; conn["err"] = str(e)[:150]; L.exception("poll")
@@ -647,22 +764,26 @@ def on_deal(d):
         notif(em + " <b>Сделка " + esc(did[:16]) + "</b>\n👤 " + esc(buyer) + " · " + str(round(price)) + "₽ · " + esc(st))
 
 # ═══════════════════ ОБНОВЛЕНИЕ ═══════════════════
+def _fetch_remote():
+    url = "https://raw.githubusercontent.com/" + GITHUB_REPO + "/" + GITHUB_BRANCH + "/" + GITHUB_FILE
+    opener = urllib.request.build_opener()
+    if PROXY:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": PROXY, "https": PROXY}))
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with opener.open(req, timeout=30) as r:
+        return r.read().decode("utf-8")
+
 def do_update(cid):
     if not GITHUB_REPO:
         send(cid, "❌ GitHub репозиторий не настроен"); return
     try:
-        url = "https://raw.githubusercontent.com/" + GITHUB_REPO + "/" + GITHUB_BRANCH + "/" + GITHUB_FILE
-        L.info("update: %s", url)
-        opener = urllib.request.build_opener()
-        if PROXY:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": PROXY, "https": PROXY}))
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with opener.open(req, timeout=30) as r: code = r.read().decode("utf-8")
+        code = _fetch_remote()
         if len(code) < 1000:
             send(cid, "❌ Файл слишком маленький"); return
         src_path = os.path.join(BASE_DIR, "pb.py")
         if os.path.exists(src_path):
-            import shutil; shutil.copy(src_path, src_path + ".bak")
+            import shutil
+            shutil.copy(src_path, src_path + ".bak")
         with open(src_path, "w", encoding="utf-8") as f: f.write(code)
         send(cid, "✅ Обновлено! Перезапускаю...")
         time.sleep(2)
@@ -673,12 +794,7 @@ def do_update(cid):
 def get_remote_version():
     if not GITHUB_REPO: return None, "нет репо"
     try:
-        url = "https://raw.githubusercontent.com/" + GITHUB_REPO + "/" + GITHUB_BRANCH + "/" + GITHUB_FILE
-        opener = urllib.request.build_opener()
-        if PROXY:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": PROXY, "https": PROXY}))
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with opener.open(req, timeout=15) as r: code = r.read().decode("utf-8")
+        code = _fetch_remote()
         m = re.search(r'BOT_VERSION\s*=\s*["\']([^"\']+)["\']', code)
         if m: return m.group(1), ""
         return None, "не нашёл версию"
@@ -692,12 +808,10 @@ def check_updates(silent=True):
     has = remote != BOT_VERSION
     _update_check["has"] = has; _update_check["remote"] = remote
     if has and not silent:
-        notif("🔄 Доступно обновление: <b>" + esc(remote) + "</b>\nТекущая: " + esc(BOT_VERSION) + "\n\nОбновить: /update")
+        notif("🔄 Обновление: " + esc(remote) + " (текущая " + esc(BOT_VERSION) + ")")
     return has, remote, ""
 
 def auto_update_worker():
-    L.info("auto_update worker started (каждые 6 часов)")
-    # Первая проверка через 5 минут после старта
     if stop.wait(5 * 60): return
     while not stop.is_set():
         try:
@@ -709,7 +823,7 @@ def auto_update_worker():
         except Exception as e: L.warning("auto_update: %s", e)
         if stop.wait(6 * 3600): return
 
-# ═══════════════════ СОЗДАНИЕ ЛОТА ═══════════════════
+# ═══════════════════ КОПИРОВАНИЕ ЛОТА ═══════════════════
 def clone_item(cid, iid):
     try: it = acc.get_item(iid)
     except Exception as e:
@@ -730,7 +844,7 @@ def clone_item(cid, iid):
         send(cid, "✅ Создан лот: <code>" + esc(nid) + "</code>")
         show_item(cid, nid)
     except Exception as e:
-        send(cid, "❌ Ошибка: " + esc(str(e)[:300]))
+        send(cid, "❌ " + esc(str(e)[:300]))
 
 # ═══════════════════ UI ═══════════════════
 def main_kb():
@@ -740,7 +854,7 @@ def main_kb():
     kb.row(B("⚡ Автоподнятие", callback_data="bump"), B("📦 Мои лоты", callback_data="items:0"))
     kb.row(B("👤 Профиль", callback_data="prof"), B("🤖 AI-проверка", callback_data="ai"))
     kb.row(B("⚙️ Настройки", callback_data="set"), B("🛠 Обновить", callback_data="update"))
-    kb.row(B("➕ Создать лот", callback_data="create_item"), B("🔄 Обновить меню", callback_data="menu"))
+    kb.row(B("➕ Создать лот", callback_data="create_item"), B("🔄 Обновить", callback_data="menu"))
     return kb
 
 def main_text():
@@ -769,7 +883,7 @@ def cmd_id(m): bot.reply_to(m, "🆔 <code>" + str(m.chat.id) + "</code>")
 @bot.message_handler(commands=["restart"])
 def cmd_restart(m):
     if not adm(m): return
-    bot.reply_to(m, "🔄 Перезапускаю...")
+    bot.reply_to(m, "🔄")
     def _r():
         time.sleep(2); os.execv(sys.executable, [sys.executable] + sys.argv)
     threading.Thread(target=_r, daemon=True).start()
@@ -777,7 +891,7 @@ def cmd_restart(m):
 @bot.message_handler(commands=["update"])
 def cmd_update(m):
     if not adm(m): return
-    bot.reply_to(m, "📥 Скачиваю новый код с GitHub...")
+    bot.reply_to(m, "📥 Скачиваю...")
     threading.Thread(target=do_update, args=(m.chat.id,), daemon=True).start()
 
 @bot.message_handler(commands=["log"])
@@ -823,7 +937,7 @@ def cb(c):
         kb.add(B("◀️", callback_data="menu"))
         edit(cid, mid_, "\n".join(lines), kb)
     elif a == "in_cookies":
-        state[cid] = {"action": "cookies"}; bot.send_message(cid, "🍪 Cookie строку:\n\n/cancel")
+        state[cid] = {"action": "cookies"}; bot.send_message(cid, "🍪 Cookie:\n\n/cancel")
     elif a == "in_token":
         state[cid] = {"action": "token"}; bot.send_message(cid, "🎫 JWT:\n\n/cancel")
     elif a == "in_ddg5":
@@ -837,11 +951,10 @@ def cb(c):
                 notif("🟢 " + INSTANCE_NAME + " переподключён")
             except Exception as e: notif("❌ " + esc(str(e)[:200]))
         threading.Thread(target=_r, daemon=True).start()
-    elif a == "chats" or a == "chats_load":
-        show_chats(cid, True)
+    elif a in ("chats","chats_load"): show_chats(cid, True)
     elif a.startswith("c:"): show_history(cid, a[2:])
     elif a.startswith("r:"):
-        state[cid] = {"action": "reply", "chat": a[2:]}; bot.send_message(cid, "✍️ Текст ответа:\n\n/cancel")
+        state[cid] = {"action": "reply", "chat": a[2:]}; bot.send_message(cid, "✍️ Текст:\n\n/cancel")
     elif a == "deals": show_deals(cid)
     elif a == "notify": show_notify(cid)
     elif a.startswith("tog:"):
@@ -863,23 +976,20 @@ def cb(c):
         show_bump(cid)
     elif a == "prof":
         if acc is None: send(cid, "❌"); return
-        refresh_profile()
-        d = profile or {}
+        refresh_profile(); d = profile or {}
         txt = ("👤 <b>Профиль</b>\n\n🆔 <code>" + esc(d.get("id","—")) + "</code>\n👤 <b>" + esc(d.get("username","—")) + "</b>")
         send(cid, txt, K().add(B("◀️", callback_data="menu")))
     elif a == "set":
         auto = "✅ вкл" if SET_D.get("auto_update", True) else "❌ выкл"
         upd = "—"
         if _update_check.get("ts"):
-            if _update_check.get("has"): upd = "🔄 " + _update_check.get("remote", "") + " доступна"
-            else: upd = "✅ актуально"
+            upd = ("🔄 " + _update_check.get("remote","") + " доступна") if _update_check.get("has") else "✅ актуально"
         lines = ["⚙️ <b>Настройки</b>", "",
                  "🆔 Инстанс: <b>" + esc(INSTANCE_NAME) + "</b>",
                  "📦 Версия: <b>" + esc(BOT_VERSION) + "</b>",
                  "🔄 Автообновление: <b>" + auto + "</b>",
-                 "📊 Обновление: " + upd,
-                 "📁 Папка: <code>" + esc(INST_DIR) + "</code>",
-                 "🔗 GitHub: " + (GITHUB_REPO if GITHUB_REPO else "не настроен")]
+                 "📊 " + upd,
+                 "📁 <code>" + esc(INST_DIR) + "</code>"]
         kb = K(row_width=1)
         kb.add(B("🔍 Проверить обновления", callback_data="check_upd"))
         kb.add(B("🔄 Автообновление " + auto, callback_data="tog:auto_update"))
@@ -895,17 +1005,15 @@ def cb(c):
             if err: send(cid, "❌ " + esc(err))
             elif has:
                 kb = K(row_width=2)
-                kb.row(B("🔧 Обновить сейчас", callback_data="update"), B("◀️", callback_data="set"))
-                send(cid, "🔄 <b>Доступно обновление!</b>\n\nТекущая: <b>" + esc(BOT_VERSION) + "</b>\nНовая: <b>" + esc(remote) + "</b>", kb)
-            else:
-                send(cid, "✅ <b>Актуальная версия:</b> " + esc(BOT_VERSION))
+                kb.row(B("🔧 Обновить", callback_data="update"), B("◀️", callback_data="set"))
+                send(cid, "🔄 Доступно: <b>" + esc(remote) + "</b>\nТекущая: <b>" + esc(BOT_VERSION) + "</b>", kb)
+            else: send(cid, "✅ Актуальная: <b>" + esc(BOT_VERSION) + "</b>")
         threading.Thread(target=_cu, daemon=True).start()
     elif a == "update":
         send(cid, "📥 Скачиваю...")
         threading.Thread(target=do_update, args=(cid,), daemon=True).start()
     elif a == "restart":
-        send(cid, "🔄"); time.sleep(1)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        send(cid, "🔄"); time.sleep(1); os.execv(sys.executable, [sys.executable] + sys.argv)
     elif a == "log": cmd_log(c)
     elif a == "ai": show_ai(cid)
     elif a == "ai_tog":
@@ -922,17 +1030,15 @@ def cb(c):
     elif a == "ai_clear":
         AI_CONFIG["api_key"] = ""; AI_CONFIG["enabled"] = False; save_ai(); show_ai(cid)
     elif a == "ai_test":
-        state[cid] = {"action": "ai_test"}; bot.send_message(cid, "🧪 Отправь фото или текст:\n\n/cancel")
+        state[cid] = {"action": "ai_test"}; bot.send_message(cid, "🧪 Фото или текст:\n\n/cancel")
     elif a == "ai_ping":
-        send(cid, "🔗 Тест связи...")
+        send(cid, "🔗 Тест...")
         threading.Thread(target=ai_ping_task, args=(cid,), daemon=True).start()
     elif a == "create_item":
-        send(cid, "➕ <b>Создание лота</b>\n\n"
-                  "Открой любой лот из 📦 Мои лоты → нажми <b>📋 Копировать</b> — будет создан новый лот на основе старого.\n\n"
-                  "Потом отредактируй его цену/название/описание/фото.")
+        send(cid, "➕ <b>Создание лота</b>\n\nОткрой лот из 📦 Мои лоты → <b>📋 Копировать</b>. Так создаётся новый лот на основе старого.\n\nПотом отредактируй цену/название/описание/фото.")
     elif a.startswith("clone:"):
         iid = a[6:]
-        send(cid, "⏳ Создаю копию...")
+        send(cid, "⏳ Копирую...")
         threading.Thread(target=clone_item, args=(cid, iid), daemon=True).start()
     elif a == "items" or a.startswith("items:"):
         try: off = int(a.split(":")[1]) if ":" in a else 0
@@ -946,11 +1052,11 @@ def cb(c):
     elif a.startswith("eddesc:"):
         state[cid] = {"action": "eddesc", "id": a[7:]}; bot.send_message(cid, "📄 Описание:\n\n/cancel")
     elif a.startswith("edphoto:"):
-        state[cid] = {"action": "edphoto", "id": a[8:]}; bot.send_message(cid, "📷 Отправь фото:\n\n/cancel")
+        state[cid] = {"action": "edphoto", "id": a[8:]}; bot.send_message(cid, "📷 Фото:\n\n/cancel")
     elif a.startswith("disc1:"):
-        state[cid] = {"action": "disc1", "id": a[6:]}; bot.send_message(cid, "💸 Скидка %:\n\n/cancel")
+        state[cid] = {"action": "disc1", "id": a[6:]}; bot.send_message(cid, "💸 %:\n\n/cancel")
     elif a == "disc":
-        state[cid] = {"action": "disc"}; bot.send_message(cid, "💰 Скидка % на все:\n\n/cancel")
+        state[cid] = {"action": "disc"}; bot.send_message(cid, "💰 % на все:\n\n/cancel")
     else: L.warning("CB unhandled: %r", a)
 
 # ═══════════════════ SHOW ═══════════════════
@@ -1023,19 +1129,12 @@ def show_items(cid, off=0):
         name = sv(g(it, "name", "title"))
         try: price = int(g(it, "price", "amount") or 0)
         except Exception: price = 0
-        lines.append("• <b>" + esc(name[:40]) + "</b> — " + str(price) + "₽")
+        photos = item_photos(it)
+        mark = "🖼" if photos else "·"
+        lines.append(mark + " <b>" + esc(name[:40]) + "</b> — " + str(price) + "₽")
         kb.add(B("📦 " + name[:20] + " · " + str(price) + "₽", callback_data="it:" + iid))
     kb.row(B("💰 Скидка на все", callback_data="disc"), B("◀️", callback_data="menu"))
     send(cid, "\n".join(lines), kb)
-
-def _extract_attachment(it):
-    """Вытаскивает attachment/attachments из лота. Возвращает FileObject или None."""
-    v = g(it, "attachment")
-    if v: return v
-    v = g(it, "attachments")
-    if isinstance(v, (list, tuple)) and v: return v[0]
-    if v: return v
-    return None
 
 def show_item(cid, iid):
     if acc is None: send(cid, "❌"); return
@@ -1044,31 +1143,40 @@ def show_item(cid, iid):
     except Exception:
         for x in get_items():
             if str(g(x, "id", "item_id")) == iid: it = x; break
-    if not it: send(cid, "❌ Лот не найден"); return
+    if not it: send(cid, "❌ Не найден"); return
     name = sv(g(it, "name", "title"))
     desc = sv(g(it, "description"), "нет описания")
     try: price = int(g(it, "price", "amount") or 0)
     except Exception: price = 0
     st = g(it, "status", "state")
     st_s = str(getattr(st, "name", st) or "—")
+    photos = item_photos(it)
+    url = item_url(iid, it)
     lines = ["📦 <b>" + esc(name) + "</b>", "",
              "💰 Цена: <b>" + str(price) + "₽</b>",
              "📊 Статус: " + esc(st_s),
-             "", "📝 " + esc(desc[:400])]
+             "🖼 Фото: <b>" + str(len(photos)) + "</b>"]
+    if url and "products/" in url:
+        lines.append("🌐 <a href=\"" + esc(url) + "\">Открыть на Playerok</a>")
+    lines += ["", "📝 " + esc(desc[:400])]
     kb = K(row_width=2)
     kb.row(B("💰 Цена", callback_data="edprice:" + iid), B("📝 Название", callback_data="edname:" + iid))
     kb.row(B("📄 Описание", callback_data="eddesc:" + iid), B("💸 Скидка", callback_data="disc1:" + iid))
     kb.row(B("📷 Сменить фото", callback_data="edphoto:" + iid), B("📋 Копировать", callback_data="clone:" + iid))
     kb.add(B("◀️", callback_data="items:0"))
-    # Отправляем с фото если оно есть
-    att = _extract_attachment(it)
     txt = "\n".join(lines)
-    if att:
-        try:
-            bot.send_photo(cid, att, caption=txt[:1024], reply_markup=kb, parse_mode="HTML")
-            return
-        except Exception as e:
-            L.debug("send_photo: %s", e)
+    # Показываем фото если есть
+    if photos:
+        for u in photos[:3]:
+            try:
+                bot.send_photo(cid, u, caption=txt[:1024], reply_markup=kb, parse_mode="HTML")
+                return
+            except Exception as e:
+                L.debug("send_photo %s: %s", u[:50], e)
+        # Если ничего не сработало — отправим ссылки
+        txt += "\n\n🖼 Фото:"
+        for u in photos[:5]:
+            txt += "\n• " + esc(u[:100])
     send(cid, txt, kb)
 
 def show_ai(cid):
@@ -1084,7 +1192,7 @@ def show_ai(cid):
     kb.row(B("🔴 Выкл" if on else "🟢 Вкл", callback_data="ai_tog"), B("🔒 Строго" if not c.get("strict") else "🟡 Мягко", callback_data="ai_mode"))
     kb.row(B("🔑 Ключ", callback_data="ai_key"), B("🎯 Провайдер", callback_data="ai_prov"))
     kb.row(B("📝 Модель", callback_data="ai_model"), B("🔗 Тест связи", callback_data="ai_ping"))
-    kb.row(B("🧪 Тест фото/текст", callback_data="ai_test"), B("🗑 Сброс", callback_data="ai_clear"))
+    kb.row(B("🧪 Тест", callback_data="ai_test"), B("🗑 Сброс", callback_data="ai_clear"))
     kb.add(B("◀️", callback_data="menu"))
     send(cid, "\n".join(lines), kb)
 
@@ -1094,16 +1202,10 @@ def show_ai_prov(cid):
         cur = "✅ " if AI_CONFIG.get("provider") == p else ""
         kb.add(B(cur + p, callback_data="ai_setp:" + p))
     kb.add(B("◀️", callback_data="ai"))
-    send(cid, "🎯 <b>Провайдер AI</b>\n\n"
-              "<b>gemini</b> — AIzaSy... с aistudio.google.com (бесплатно)\n"
-              "<b>openai</b> — sk-... с platform.openai.com\n"
-              "<b>anthropic</b> — sk-ant-... с console.anthropic.com\n"
-              "<b>openrouter</b> — sk-or-... с openrouter.ai\n"
-              "<b>deepseek</b> — с platform.deepseek.com\n"
-              "<b>groq</b> — с console.groq.com (бесплатно)", kb)
+    send(cid, "🎯 Провайдер:\n\ngemini — AIzaSy... (бесплатно)\nopenai — sk-...\nanthropic — sk-ant-...\nopenrouter — sk-or-...\ndeepseek\ngroq (бесплатно)", kb)
 
 def ai_ping_task(cid):
-    if not AI_CONFIG.get("enabled"): send(cid, "❌ AI выключен"); return
+    if not AI_CONFIG.get("enabled"): send(cid, "❌ выкл"); return
     key = (AI_CONFIG.get("api_key") or "").strip()
     if not key: send(cid, "❌ Нет ключа"); return
     prov = (AI_CONFIG.get("provider") or "gemini").lower()
@@ -1116,25 +1218,20 @@ def ai_ping_task(cid):
             return {"model": model, "max_tokens": 20, "messages": [{"role": "user", "content": "Ответь: РАБОТАЕТ"}]}
         txt = ai_call(_b, prov, key, AI_CONFIG.get("model"))
         dt = time.time() - t0
-        if txt:
-            send(cid, "✅ <b>AI отвечает!</b>\n\nПровайдер: <code>" + esc(prov) + "</code>\nМодель: <code>" + esc(model) + "</code>\nОтвет: <i>" + esc(txt[:100]) + "</i>\nВремя: " + str(round(dt,1)) + " сек")
-        else: send(cid, "❌ Пустой ответ")
-    except Exception as e:
-        send(cid, "❌ " + esc(str(e)[:250]))
+        if txt: send(cid, "✅ AI отвечает\n\n" + esc(prov) + " · " + esc(model) + "\nОтвет: <i>" + esc(txt[:100]) + "</i>\n" + str(round(dt,1)) + " сек")
+        else: send(cid, "❌ Пустой")
+    except Exception as e: send(cid, "❌ " + esc(str(e)[:250]))
 
 # ═══════════════════ TEXT ═══════════════════
 @bot.message_handler(content_types=["text"])
 def handle_text(m):
     uid = int(m.chat.id) if m.chat.id else 0
     if not is_authorized(uid):
-        if uid == MAIN_ADMIN:
-            pass
-        elif (m.text or "").strip() == ADMIN_PASSWORD and ADMIN_PASSWORD:
+        if (m.text or "").strip() == ADMIN_PASSWORD and ADMIN_PASSWORD:
             if uid not in USERS_STATE.get("authorized", []):
                 USERS_STATE.setdefault("authorized", []).append(uid); save_users()
-            bot.reply_to(m, "✅ Добро пожаловать! Отправь /start"); return
-        else:
-            bot.reply_to(m, "🔐 Введи пароль для доступа:"); return
+            bot.reply_to(m, "✅ Добро пожаловать! /start"); return
+        bot.reply_to(m, "🔐 Введи пароль:"); return
 
     st = state.get(m.chat.id)
     a = st.get("action") if isinstance(st, dict) else st
@@ -1147,17 +1244,17 @@ def handle_text(m):
     elif a == "ddg5":
         state.pop(m.chat.id, None); CREDS["ddg5"] = (m.text or "").strip(); save_creds(); bot.reply_to(m, "✅ ddg5")
     elif a == "ai_key":
-        state.pop(m.chat.id, None); AI_CONFIG["api_key"] = (m.text or "").strip(); AI_CONFIG["enabled"] = True; save_ai(); bot.reply_to(m, "✅ Ключ сохранён, AI включён")
+        state.pop(m.chat.id, None); AI_CONFIG["api_key"] = (m.text or "").strip(); AI_CONFIG["enabled"] = True; save_ai(); bot.reply_to(m, "✅ Ключ сохранён")
     elif a == "ai_model":
-        state.pop(m.chat.id, None); AI_CONFIG["model"] = (m.text or "").strip(); save_ai(); bot.reply_to(m, "✅ Модель")
+        state.pop(m.chat.id, None); AI_CONFIG["model"] = (m.text or "").strip(); save_ai(); bot.reply_to(m, "✅")
     elif a == "ai_test":
         state.pop(m.chat.id, None); v = (m.text or "").strip()
         if not v: return
-        bot.reply_to(m, "🔍 Проверяю...")
+        bot.reply_to(m, "🔍...")
         def _t():
             ok, r = ai_check_text(v)
             if ok: bot.send_message(m.chat.id, "✅ Нарушений нет")
-            else: bot.send_message(m.chat.id, "⚠️ <b>Найдено:</b>\n" + esc(r[:500]))
+            else: bot.send_message(m.chat.id, "⚠️ " + esc(r[:500]))
         threading.Thread(target=_t, daemon=True).start()
     elif a == "reply":
         state.pop(m.chat.id, None); cid = st.get("chat"); text = (m.text or "").strip()
@@ -1165,7 +1262,7 @@ def handle_text(m):
         okv, msg = guard_text(text, "сообщении")
         if not okv: bot.reply_to(m, msg); return
         try:
-            acc.send_message(chat_id=cid, text=text); bot.reply_to(m, "✅ Отправлено")
+            acc.send_message(chat_id=cid, text=text); bot.reply_to(m, "✅")
         except Exception as e: bot.reply_to(m, "❌ " + esc(str(e)[:200]))
     elif a == "edprice":
         state.pop(m.chat.id, None); iid = st.get("id")
@@ -1174,7 +1271,7 @@ def handle_text(m):
         try:
             it = acc.get_item(iid)
             acc.update_item(iid, name=it.name, price=p, description=getattr(it,"description","") or "", options=getattr(it,"options",None) or [], data_fields=getattr(it,"data_fields",None) or [])
-            bot.reply_to(m, "✅ Цена " + str(p) + "₽"); show_item(m.chat.id, iid)
+            bot.reply_to(m, "✅ " + str(p) + "₽"); show_item(m.chat.id, iid)
         except Exception as e: bot.reply_to(m, "❌ " + esc(str(e)[:200]))
     elif a == "edname":
         state.pop(m.chat.id, None); iid = st.get("id"); v = (m.text or "").strip()
@@ -1197,7 +1294,7 @@ def handle_text(m):
     elif a == "disc":
         state.pop(m.chat.id, None)
         try: pct = float((m.text or "").strip().replace(",", "."))
-        except Exception: bot.reply_to(m, "❌ Число"); return
+        except Exception: bot.reply_to(m, "❌"); return
         bot.reply_to(m, "⏳")
         def _d():
             ok = err = 0
@@ -1208,7 +1305,7 @@ def handle_text(m):
                     acc.update_item(iid, name=full.name, price=new, description=getattr(full,"description","") or "", options=getattr(full,"options",None) or [], data_fields=getattr(full,"data_fields",None) or [])
                     ok += 1
                 except Exception: err += 1
-            bot.send_message(m.chat.id, "✅ " + str(ok) + ", ❌ " + str(err))
+            bot.send_message(m.chat.id, "✅ " + str(ok) + " / ❌ " + str(err))
         threading.Thread(target=_d, daemon=True).start()
     elif a == "disc1":
         state.pop(m.chat.id, None); iid = st.get("id")
@@ -1243,17 +1340,19 @@ def on_photo(m):
         try:
             f = bot.get_file(m.photo[-1].file_id); content = bot.download_file(f.file_path)
         except Exception as e: bot.reply_to(m, "❌ " + esc(str(e))); return
-        bot.reply_to(m, "🔍 Анализирую...")
+        bot.reply_to(m, "🔍...")
         def _t():
             ok, r = ai_check_image(content, "image/jpeg")
             if ok: bot.send_message(m.chat.id, "✅ Нарушений нет")
-            else: bot.send_message(m.chat.id, "⚠️ <b>Найдено:</b>\n" + esc(r[:500]))
+            else: bot.send_message(m.chat.id, "⚠️ " + esc(r[:500]))
         threading.Thread(target=_t, daemon=True).start()
 
 # ═══════════════════ MAIN ═══════════════════
 def main():
-    L.info("=== Playerok Bot v" + BOT_VERSION + " — instance: " + INSTANCE_NAME + " ===")
-    L.info("Папка инстанса: %s", INST_DIR)
+    L.info("=== Playerok Bot v" + BOT_VERSION + " · instance: " + INSTANCE_NAME + " ===")
+    L.info("Папка: %s", INST_DIR)
+    L.info("config: %s", CONFIG_FILE)
+    L.info("seen loaded: msgs=%d deals=%d", len(seen_m), len(seen_d))
     if OK and cookie_str():
         try:
             connect()
@@ -1262,7 +1361,7 @@ def main():
             refresh_profile()
         except Exception as e: L.error("startup: %s", e)
     try:
-        notif("🚀 <b>" + INSTANCE_NAME + "</b> v" + BOT_VERSION + " запущен\n🔗 GitHub: " + (GITHUB_REPO if GITHUB_REPO else "не настроен"))
+        notif("🚀 <b>" + INSTANCE_NAME + "</b> v" + BOT_VERSION + " · " + (GITHUB_REPO or "нет GitHub"))
     except Exception: pass
     L.info("telegram polling start")
     try:
