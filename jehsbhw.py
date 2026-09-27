@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v10.2 — стабильная версия с фото."""
-import json, logging, os, re, sys, threading, time, urllib.request, subprocess, base64
+"""KiriillBR Playerok Bot v11.0 — создание лотов, ручное обновление."""
+import json, logging, os, re, sys, threading, time, urllib.request, base64
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-BOT_VERSION = "10.2"
+BOT_VERSION = "11.0"
 
 # ═══════════════════ ПУТИ ═══════════════════
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -42,30 +42,21 @@ setup_logging()
 L = logging.getLogger("Bot")
 
 # ═══════════════════ КОНФИГ ═══════════════════
-def load_cfg():
-    return jload(CONFIG_FILE, {})
-
-def save_cfg(c):
-    jsave(CONFIG_FILE, c)
+def load_cfg(): return jload(CONFIG_FILE, {})
+def save_cfg(c): jsave(CONFIG_FILE, c)
 
 def setup_wizard():
-    print("=" * 60)
-    print("  Первый запуск KiriillBR Playerok Bot")
-    print("=" * 60)
-    print()
+    print("=" * 60); print("  Первый запуск KiriillBR Playerok Bot"); print("=" * 60); print()
     while True:
         nick = input("Ник бота (латиница/цифры/_-): ").strip()
         nick = re.sub(r"[^A-Za-z0-9_\-]", "_", nick)[:32]
-        if not nick:
-            print("Пустой — ещё раз"); continue
+        if not nick: print("Пустой"); continue
         break
     cfg = {"instance": nick}
     cfg["token"] = input("1. Токен бота: ").strip()
-    cfg["admin_password"] = input("2. Пароль для входа: ").strip()
-    try:
-        cfg["admin_id"] = int(input("3. Telegram ID (у @userinfobot): ").strip())
-    except ValueError:
-        cfg["admin_id"] = 0
+    cfg["admin_password"] = input("2. Пароль: ").strip()
+    try: cfg["admin_id"] = int(input("3. Telegram ID: ").strip())
+    except ValueError: cfg["admin_id"] = 0
     cfg["proxy"] = input("4. Прокси [Enter=нет]: ").strip()
     cfg["github_repo"] = input("5. GitHub owner/repo [Enter=silnikovkirill04-web/hehshe]: ").strip() or "silnikovkirill04-web/hehshe"
     cfg["github_branch"] = "main"
@@ -73,10 +64,8 @@ def setup_wizard():
     cfg["auto_update"] = True
     cfg["tmpl"] = "Здравствуйте, {buyer}! {message}"
     save_cfg(cfg)
-    print()
-    print("✅ Сохранено:", CONFIG_FILE)
-    print("📁 Инстанс:", os.path.join(BASE_DIR, nick))
-    print()
+    print("\n✅ Сохранено:", CONFIG_FILE)
+    print("📁 Инстанс:", os.path.join(BASE_DIR, nick), "\n")
     return cfg
 
 CFG = load_cfg()
@@ -104,6 +93,7 @@ NAMES_FILE    = os.path.join(INST_DIR, "chatnames.json")
 PLUGINS_FILE  = os.path.join(INST_DIR, "plugins.json")
 PLUGINS_DIR   = os.path.join(INST_DIR, "plugins")
 SEEN_FILE     = os.path.join(INST_DIR, "seen.json")
+DRAFT_FILE    = os.path.join(INST_DIR, "draft.json")
 LOG_FILE      = os.path.join(INST_DIR, "bot.log")
 os.makedirs(PLUGINS_DIR, exist_ok=True)
 
@@ -112,12 +102,10 @@ try:
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter("%(asctime)s,%(msecs)03d [%(levelname)-5s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S"))
     logging.getLogger().addHandler(fh)
-except Exception as e:
-    print("log file:", e)
+except Exception as e: print("log file:", e)
 
 if PROXY:
-    try:
-        telebot.apihelper.proxy = {"http": PROXY, "https": PROXY}
+    try: telebot.apihelper.proxy = {"http": PROXY, "https": PROXY}
     except Exception: pass
 
 # ═══════════════════ ХРАНИЛИЩА ═══════════════════
@@ -152,8 +140,7 @@ def save_seen():
         m = list(seen_m)[-5000:]
         d = list(seen_d)[-5000:]
         jsave(SEEN_FILE, {"msgs": m, "deals": d})
-    except Exception as e:
-        L.warning("save_seen: %s", e)
+    except Exception as e: L.warning("save_seen: %s", e)
 
 # ═══════════════════ СЛУЖЕБНЫЕ ЧАТЫ ═══════════════════
 SUPPORT_IDS = {"1f1b989c-c8ff-62c2-61ae-6f0b6ec96725": "🆘 Поддержка"}
@@ -173,23 +160,19 @@ def chat_name(cid):
     return None
 
 # ═══════════════════ PLAYEROKAPI ═══════════════════
-OK = False
-Account = None
-BotCheck = Unauth = Exception
+OK = False; Account = None; BotCheck = Unauth = Exception
 try:
     from playerokapi.account import Account
     from playerokapi.exceptions import BotCheckDetectedException as BotCheck, UnauthorizedError as Unauth
-    OK = True
-    L.info("playerokapi OK")
-except Exception as e:
-    L.error("playerokapi: %s", e)
+    OK = True; L.info("playerokapi OK")
+except Exception as e: L.error("playerokapi: %s", e)
 
 # ═══════════════════ STATE ═══════════════════
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 acc = None
 stop = threading.Event()
 state = {}
-cache = {"chats": [], "ts": 0}
+cache = {"chats": [], "ts": 0, "games": [], "games_ts": 0}
 conn = {"ok": False, "err": "", "method": ""}
 profile = {}
 seen_m = set(SEEN_D.get("msgs") or [])
@@ -198,6 +181,9 @@ last_bump = {"ts": 0}
 plugin_apis = {}
 ucache = {}
 _update_check = {"ts": 0, "has": False, "remote": ""}
+DRAFT = jload(DRAFT_FILE, {})
+
+def save_draft(): jsave(DRAFT_FILE, DRAFT)
 
 # ═══════════════════ HELPERS ═══════════════════
 def esc(s): return str(s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
@@ -249,7 +235,6 @@ def cookie_str():
 
 # ═══════════════════ ФОТО / URL ═══════════════════
 def _to_url(x):
-    """Универсально превращает FileObject/строку/dict/list в URL."""
     if x is None: return ""
     if isinstance(x, str):
         s = x.strip()
@@ -261,7 +246,7 @@ def _to_url(x):
         return ""
     if isinstance(x, bytes): return ""
     if isinstance(x, dict):
-        for k in ("url","link","href","src","path","preview_url","previewUrl","image_url","imageUrl","file_url","fileUrl","download_url","downloadUrl","cdn_url","cdnUrl"):
+        for k in ("url","link","href","src","path","file_url","fileUrl","preview_url","image_url","download_url"):
             u = _to_url(x.get(k))
             if u: return u
         for v in x.values():
@@ -271,83 +256,47 @@ def _to_url(x):
         for y in x:
             u = _to_url(y)
             if u: return u
-    # FileObject — берём .url
-    for attr in ("url","link","href","src","path","file_url","preview_url","image_url","download_url","cdn_url"):
+    for attr in ("url","link","href","src","path","file_url","preview_url","image_url","download_url"):
         try:
             v = getattr(x, attr, None)
             if v: return _to_url(v)
         except Exception: pass
-    # vars()
     try:
-        for k, v in vars(x).items():
-            if isinstance(v, str) and v.startswith("http"): return v
         for v in vars(x).values():
-            u = _to_url(v)
-            if u: return u
-    except Exception: pass
-    # str/repr
-    try:
-        s = str(x)
-        m = re.search(r"https?://[^\s\"'<>]+", s)
-        if m: return m.group(0)
+            if isinstance(v, str) and v.startswith("http"): return v
     except Exception: pass
     try:
-        s = repr(x)
-        m = re.search(r"https?://[^\s\"'<>]+", s)
+        m = re.search(r"https?://[^\s\"'<>]+", str(x))
         if m: return m.group(0)
     except Exception: pass
     return ""
 
 def item_photos(it):
-    """Возвращает список всех URL фото лота."""
     out = []; seen = set()
     def add(v):
         u = _to_url(v)
-        if u and u not in seen:
-            seen.add(u); out.append(u)
-    # прямые поля
+        if u and u not in seen: seen.add(u); out.append(u)
     for f in ("attachment","attachments","images","photos","files","banner","image",
-              "preview","thumbnail","picture","cover","main_image","photo",
-              "media","gallery","screenshots","banners","pics","imgs",
-              "image_url","imageUrl","photo_url","photoUrl","thumbnail_url"):
+              "preview","thumbnail","picture","cover","main_image","photo","media","gallery"):
         v = g(it, f)
         if v: add(v)
-    # raw
-    for ra in ("raw","_raw","data","_data","json","_json","payload","_payload"):
-        try: raw = getattr(it, ra, None)
-        except Exception: raw = None
-        if raw is None and isinstance(it, dict): raw = it.get(ra)
-        if isinstance(raw, (dict, list)): add(raw)
-    # vars
     try:
         for k, v in vars(it).items():
             kl = str(k).lower()
-            if any(t in kl for t in ("attach","image","photo","banner","pic","cover","preview","thumb","media")):
-                add(v)
-    except Exception: pass
-    # dict
-    if isinstance(it, dict):
-        for k, v in it.items():
-            kl = str(k).lower()
             if any(t in kl for t in ("attach","image","photo","banner","pic","cover")):
                 add(v)
+    except Exception: pass
     return out
 
 def item_url(iid, it=None):
     if it:
-        for k in ("url","link","href","permalink","web_url","webUrl"):
-            v = g(it, k)
-            if v and isinstance(v, str) and v.strip():
-                u = _to_url(v)
-                if u: return u
         s = g(it, "slug")
         if s and isinstance(s, str) and s.strip():
             s = s.strip()
             if s.startswith("http"): return s
             if s.startswith("products/"): return "https://playerok.com/" + s
             return "https://playerok.com/products/" + s
-    if iid:
-        return "https://playerok.com/products/" + str(iid)
+    if iid: return "https://playerok.com/products/" + str(iid)
     return "https://playerok.com/"
 
 # ═══════════════════ PLAYEROK API ═══════════════════
@@ -378,6 +327,18 @@ def get_items():
         r = acc.get_my_items()
         return list(getattr(r, "items", None) or (r if isinstance(r, (list, tuple)) else []))
     except Exception: return []
+
+def get_games(force=False):
+    if acc is None: return []
+    if not force and cache.get("games") and time.time() - cache.get("games_ts", 0) < 3600:
+        return cache["games"]
+    try:
+        r = acc.get_games()
+        games = list(getattr(r, "games", None) or (r if isinstance(r, (list, tuple)) else []))
+        cache["games"] = games; cache["games_ts"] = time.time()
+        return games
+    except Exception as e:
+        L.warning("get_games: %s", e); return []
 
 def refresh_profile():
     global profile
@@ -486,12 +447,6 @@ def mid(m):
     for f in ("id","message_id","msg_id","uid"):
         v = g(m, f)
         if v: return str(v)
-    try:
-        raw = getattr(m, "raw", None) or getattr(m, "_raw", None)
-        if isinstance(raw, dict):
-            for f in ("id","message_id","uid"):
-                if raw.get(f): return str(raw[f])
-    except Exception: pass
     t = mtext(m); ts = mts(m); au = sender_id(None, m)
     if t or ts: return "h%d:%s:%s" % (hash(t), ts, au)
     return ""
@@ -509,15 +464,14 @@ AI_DEFAULTS = {
 AI_PROMPT = """Проверь изображение на нарушения правил маркетплейса Playerok.
 
 ЗАПРЕЩЕНО (если есть — BAD):
-1. Контакты: телефоны, email, @ники, Telegram, Телеграм, ТГ, WhatsApp, Ватсап, Viber, ВК, Discord, t.me, wa.me, vk.com, QR-коды, ссылки на сторонние сайты
-2. Обход комиссии: напрямую, в лс, в личку, без комиссии, вне сайта, на карту, на СБП, сбер, тинькоф, USDT, BTC
-3. Гарантии: гарантия, гарантирую, пожизненная, вечная, навсегда, 100% гарант, без гарантии, не несу ответственность, ответственность снимается. РАЗРЕШЕНО: "гарантия 48 часов" и больше, "гарантия до подтверждения"
-4. Читы: чит, читы, cheat, hack, взлом, хакер
-5. Запрещённые товары: VPN, proxy, tdata, token-акк, cookie-акк, рефанд, казино, ставки, 18+, эротика, 🔞, пиратство, торрент, кряк, смс-бомбер, DDoS, пробив, обнал, дропы, номера телефонов, госуслуги, паспорт, СНИЛС, курсы заработка
-6. Оформление: имитация офиц. магазина Playerok, мат, оскорбления, политика, экстремизм
-7. Недостоверность: случайная игра, рандом, от 1 до 10, прайс-лист, каталог, бартер, обмен
+1. Контакты: телефоны, email, @ники, Telegram, ТГ, WhatsApp, Viber, ВК, Discord, t.me, QR-коды, ссылки
+2. Обход комиссии: напрямую, в лс, в личку, без комиссии, на карту, сбер, тинькоф, USDT, BTC
+3. Гарантии: гарантия, пожизненная, навсегда, 100% гарант, без гарантии, не несу ответственность. РАЗРЕШЕНО: "гарантия 48 часов" и больше
+4. Читы: чит, cheat, hack, взлом
+5. Запрещённые: VPN, proxy, tdata, рефанд, казино, 18+, 🔞, пиратство, торрент, ddos, обнал, номера телефонов, госуслуги
+6. Оформление: имитация офиц. магазина, мат, политика
 
-РАЗРЕШЕНО: игровые скриншоты, логотипы игр, стикеры/эмодзи, молния ⚡, 🔥, ⭐, 🎮, 💰, персонажи аниме/игр, инструкции, "гарантия 48 часов" и больше
+РАЗРЕШЕНО: игровые скриншоты, логотипы игр, ⚡🔥⭐🎮💰, персонажи, "гарантия 48 часов"
 
 ОТВЕТ: строго OK или BAD: <список>"""
 
@@ -574,7 +528,7 @@ def ai_check_text(text):
     key = (AI_CONFIG.get("api_key") or "").strip()
     if not key: return True, ""
     prov = (AI_CONFIG.get("provider") or "gemini").lower()
-    p = ("Проверь текст на нарушения правил Playerok. ЗАПРЕЩЕНО: контакты, обход комиссии, гарантии (кроме 48 часов и больше), читы, VPN, tdata, крипта, казино, 18+, пиратство, мат. Ответь OK или BAD: список. ТЕКСТ: " + text[:3000])
+    p = ("Проверь текст на нарушения правил Playerok. ЗАПРЕЩЕНО: контакты, обход комиссии, гарантии (кроме 48ч), читы, VPN, крипта, казино, 18+, мат. Ответь OK или BAD: список. ТЕКСТ: " + text[:3000])
     def _b(model, kind):
         if kind == "anthropic": return {"model": model, "max_tokens": 200, "messages": [{"role": "user", "content": p}]}
         if kind == "gemini": return {"contents": [{"parts": [{"text": p}]}]}
@@ -757,7 +711,7 @@ def _fetch_remote():
 
 def do_update(cid):
     if not GITHUB_REPO:
-        send(cid, "❌ GitHub репозиторий не настроен"); return
+        send(cid, "❌ GitHub не настроен"); return
     try:
         code = _fetch_remote()
         if len(code) < 1000:
@@ -789,7 +743,7 @@ def check_updates(silent=True):
     has = remote != BOT_VERSION
     _update_check["has"] = has; _update_check["remote"] = remote
     if has and not silent:
-        notif("🔄 Обновление: " + esc(remote) + " (текущая " + esc(BOT_VERSION) + ")")
+        notif("🔄 Доступно: " + esc(remote) + " (текущая " + esc(BOT_VERSION) + ")")
     return has, remote, ""
 
 def auto_update_worker():
@@ -804,28 +758,137 @@ def auto_update_worker():
         except Exception as e: L.warning("auto_update: %s", e)
         if stop.wait(6 * 3600): return
 
-# ═══════════════════ СОЗДАНИЕ ЛОТА ═══════════════════
-def clone_item(cid, iid):
-    try: it = acc.get_item(iid)
-    except Exception as e:
-        send(cid, "❌ " + esc(str(e)[:200])); return
+# ═══════════════════ МАСТЕР СОЗДАНИЯ ЛОТА ═══════════════════
+def draft_start(cid):
+    DRAFT[cid] = {"step": "game"}
+    save_draft()
+    show_games(cid)
+
+def show_games(cid, force=False, page=0):
+    games = get_games(force=force)
+    if not games:
+        send(cid, "⏳ Загружаю игры...")
+        games = get_games(force=True)
+    if not games:
+        send(cid, "❌ Не удалось загрузить игры"); return
+    games_sorted = sorted(games, key=lambda x: str(g(x, "name", default="")).lower())
+    per_page = 10
+    chunk = games_sorted[page*per_page:(page+1)*per_page]
+    kb = K(row_width=1)
+    for gm in chunk:
+        gid = str(g(gm, "id", "slug", default=""))
+        nm = sv(g(gm, "name"), "?")
+        kb.add(B("🎮 " + nm[:40], callback_data="cr_game:" + gid))
+    nav = []
+    if page > 0: nav.append(B("⬅️", callback_data=f"cr_games_p:{page-1}"))
+    if (page+1)*per_page < len(games_sorted): nav.append(B("➡️", callback_data=f"cr_games_p:{page+1}"))
+    if nav: kb.row(*nav)
+    kb.row(B("🔄 Обновить", callback_data="cr_games_r"), B("❌ Отмена", callback_data="cr_cancel"))
+    send(cid, "➕ <b>Создание лота</b>\n\nВыбери игру (стр. " + str(page+1) + "):", kb)
+
+def show_categories(cid, game_id):
+    send(cid, "⏳ Загружаю категории...")
     try:
-        cat = g(it, "category"); obt = g(it, "obtaining_type")
-        new = acc.create_item(
-            game_category_id=cat.id if cat else None,
-            obtaining_type_id=obt.id if obt else None,
-            name=(it.name or "")[:80] + " (копия)",
-            price=int(it.price or 0),
-            description=getattr(it, "description", "") or "",
-            options=getattr(it, "options", None) or [],
-            data_fields=getattr(it, "data_fields", None) or [],
-            attachments=[],
-        )
-        nid = str(g(new, "id") or "")
-        send(cid, "✅ Создан лот: <code>" + esc(nid) + "</code>")
-        show_item(cid, nid)
+        gm = acc.get_game(slug=game_id) if not game_id[0].isdigit() else acc.get_game(id=game_id)
+    except Exception:
+        try: gm = acc.get_game(slug=game_id)
+        except Exception as e:
+            send(cid, "❌ " + esc(str(e)[:150])); return
+    cats = list(getattr(gm, "categories", []) or [])
+    if not cats:
+        send(cid, "❌ Нет категорий в этой игре"); return
+    kb = K(row_width=1)
+    for c in cats:
+        cid_ = str(g(c, "id", default=""))
+        nm = sv(g(c, "name"), "?")
+        kb.add(B("📁 " + nm[:40], callback_data="cr_cat:" + game_id + "|" + cid_))
+    kb.add(B("❌ Отмена", callback_data="cr_cancel"))
+    DRAFT[str(cid)] = {"step": "category", "game_id": game_id}
+    save_draft()
+    send(cid, "🎮 <b>" + esc(sv(g(gm, "name"), game_id)) + "</b>\n\nВыбери категорию:", kb)
+
+def show_obtaining(cid, game_id, cat_id):
+    try: cat = acc.get_game_category(cat_id)
     except Exception as e:
-        send(cid, "❌ " + esc(str(e)[:300]))
+        send(cid, "❌ " + esc(str(e)[:150])); return
+    try:
+        obts = list(getattr(acc.get_game_category_obtaining_types(cat_id), "obtaining_types", []) or [])
+    except Exception:
+        obts = []
+    if not obts:
+        # если способов нет — сразу к названию
+        DRAFT[str(cid)] = {"step": "name", "game_id": game_id, "cat_id": cat_id, "obt_id": None}
+        save_draft()
+        send(cid, "ℹ️ Способы передачи не требуются.\n\n📝 Пришли <b>название</b> лота:")
+        return
+    kb = K(row_width=1)
+    for ob in obts:
+        oid = str(g(ob, "id", default=""))
+        nm = sv(g(ob, "name"), "?")
+        kb.add(B("📦 " + nm[:40], callback_data="cr_obt:" + game_id + "|" + cat_id + "|" + oid))
+    kb.add(B("❌ Отмена", callback_data="cr_cancel"))
+    DRAFT[str(cid)] = {"step": "obtaining", "game_id": game_id, "cat_id": cat_id}
+    save_draft()
+    send(cid, "📁 <b>" + esc(sv(g(cat, "name"), cat_id)) + "</b>\n\nСпособ передачи:", kb)
+
+def start_name_input(cid, game_id, cat_id, obt_id):
+    DRAFT[str(cid)] = {"step": "name", "game_id": game_id, "cat_id": cat_id, "obt_id": obt_id}
+    save_draft()
+    send(cid, "📝 Пришли <b>название</b> лота:\n\n/cancel — отмена")
+
+def start_price_input(cid, name):
+    DRAFT[str(cid)]["step"] = "price"
+    DRAFT[str(cid)]["name"] = name
+    save_draft()
+    send(cid, "💰 Пришли <b>цену</b> (число):\n\n/cancel — отмена")
+
+def start_desc_input(cid, price):
+    DRAFT[str(cid)]["step"] = "description"
+    DRAFT[str(cid)]["price"] = price
+    save_draft()
+    send(cid, "📄 Пришли <b>описание</b>:\n\n/cancel — отмена")
+
+def finalize_draft(cid, desc):
+    d = DRAFT.get(str(cid)) or {}
+    d["description"] = desc
+    save_draft()
+    # Проверка
+    ok_n, hits_n = validate_text(d.get("name", ""))
+    ok_d, hits_d = validate_text(desc)
+    if not ok_n or not ok_d:
+        hits = list(dict.fromkeys(hits_n + hits_d))
+        send(cid, "⚠️ <b>Заблокировано</b>\n\n" + ", ".join(hits) + "\n\nПопробуй /start и создай заново")
+        DRAFT.pop(str(cid), None); save_draft(); return
+    # Создаём
+    send(cid, "⏳ Создаю лот...")
+    def _create():
+        try:
+            kw = {
+                "game_category_id": d["cat_id"],
+                "name": d["name"],
+                "price": int(d["price"]),
+                "description": legal_wrap(d["description"]),
+                "options": [],
+                "data_fields": [],
+                "attachments": [],
+            }
+            if d.get("obt_id"):
+                kw["obtaining_type_id"] = d["obt_id"]
+            try:
+                it = acc.create_item(**kw)
+            except TypeError:
+                # если obtaining_type_id не требуется
+                kw.pop("obtaining_type_id", None)
+                it = acc.create_item(**kw)
+            iid = str(g(it, "id", default=""))
+            DRAFT.pop(str(cid), None); save_draft()
+            send(cid, "✅ <b>Лот создан!</b>\n🆔 <code>" + esc(iid) + "</code>")
+            try: show_item(cid, iid)
+            except Exception: pass
+        except Exception as e:
+            L.exception("create_item")
+            send(cid, "❌ Ошибка: <code>" + esc(str(e)[:300]) + "</code>")
+    threading.Thread(target=_create, daemon=True).start()
 
 # ═══════════════════ UI ═══════════════════
 def main_kb():
@@ -833,9 +896,9 @@ def main_kb():
     kb.row(B("🔌 Подключение", callback_data="conn"), B("📨 Чаты", callback_data="chats"))
     kb.row(B("🔔 Уведомления", callback_data="notify"), B("📋 Сделки", callback_data="deals"))
     kb.row(B("⚡ Автоподнятие", callback_data="bump"), B("📦 Мои лоты", callback_data="items:0"))
-    kb.row(B("👤 Профиль", callback_data="prof"), B("🤖 AI-проверка", callback_data="ai"))
-    kb.row(B("⚙️ Настройки", callback_data="set"), B("🛠 Обновить", callback_data="update"))
-    kb.row(B("➕ Создать лот", callback_data="create_item"), B("🔄 Обновить", callback_data="menu"))
+    kb.row(B("➕ Создать лот", callback_data="cr_start"), B("👤 Профиль", callback_data="prof"))
+    kb.row(B("🤖 AI-проверка", callback_data="ai"), B("⚙️ Настройки", callback_data="set"))
+    kb.row(B("🛠 Обновить бота", callback_data="update"), B("🔄 Обновить меню", callback_data="menu"))
     return kb
 
 def main_text():
@@ -854,7 +917,7 @@ def main_text():
 @bot.message_handler(commands=["start","menu"])
 def cmd_start(m):
     if not adm(m):
-        bot.reply_to(m, "⛔ Нет доступа. Введи пароль."); return
+        bot.reply_to(m, "⛔ Нет доступа"); return
     state.pop(m.chat.id, None)
     bot.send_message(m.chat.id, main_text(), reply_markup=main_kb())
 
@@ -887,7 +950,9 @@ def cmd_log(m):
 
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel(m):
-    state.pop(m.chat.id, None); bot.reply_to(m, "❌ Отменено")
+    state.pop(m.chat.id, None)
+    DRAFT.pop(str(m.chat.id), None); save_draft()
+    bot.reply_to(m, "❌ Отменено")
 
 # ═══════════════════ CALLBACKS ═══════════════════
 @bot.callback_query_handler(func=lambda c: True)
@@ -991,7 +1056,7 @@ def cb(c):
             else: send(cid, "✅ Актуальная: <b>" + esc(BOT_VERSION) + "</b>")
         threading.Thread(target=_cu, daemon=True).start()
     elif a == "update":
-        send(cid, "📥 Скачиваю...")
+        send(cid, "📥 Скачиваю обновление с GitHub...")
         threading.Thread(target=do_update, args=(cid,), daemon=True).start()
     elif a == "restart":
         send(cid, "🔄"); time.sleep(1); os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -1015,12 +1080,32 @@ def cb(c):
     elif a == "ai_ping":
         send(cid, "🔗 Тест...")
         threading.Thread(target=ai_ping_task, args=(cid,), daemon=True).start()
-    elif a == "create_item":
-        send(cid, "➕ <b>Создание лота</b>\n\nОткрой лот из 📦 Мои лоты → <b>📋 Копировать</b>. Так создаётся новый лот на основе старого.\n\nПотом отредактируй цену/название/описание/фото.")
-    elif a.startswith("clone:"):
-        iid = a[6:]
-        send(cid, "⏳ Копирую...")
-        threading.Thread(target=clone_item, args=(cid, iid), daemon=True).start()
+    # ─── МАСТЕР СОЗДАНИЯ ЛОТА ───
+    elif a == "cr_start":
+        draft_start(cid)
+    elif a == "cr_cancel":
+        DRAFT.pop(str(cid), None); save_draft()
+        edit(cid, mid_, "❌ Создание отменено", K().add(B("◀️", callback_data="menu")))
+    elif a == "cr_games_r":
+        show_games(cid, force=True)
+    elif a.startswith("cr_games_p:"):
+        try: p = int(a.split(":")[1])
+        except Exception: p = 0
+        show_games(cid, page=p)
+    elif a.startswith("cr_game:"):
+        gid = a[8:]
+        show_categories(cid, gid)
+    elif a.startswith("cr_cat:"):
+        _, rest = a.split(":", 1)
+        parts = rest.split("|", 1)
+        if len(parts) == 2:
+            show_obtaining(cid, parts[0], parts[1])
+    elif a.startswith("cr_obt:"):
+        _, rest = a.split(":", 1)
+        parts = rest.split("|")
+        if len(parts) == 3:
+            start_name_input(cid, parts[0], parts[1], parts[2])
+    # ─── ЛОТЫ ───
     elif a == "items" or a.startswith("items:"):
         try: off = int(a.split(":")[1]) if ":" in a else 0
         except Exception: off = 0
@@ -1114,7 +1199,8 @@ def show_items(cid, off=0):
         mark = "🖼" if photos else "·"
         lines.append(mark + " <b>" + esc(name[:40]) + "</b> — " + str(price) + "₽")
         kb.add(B("📦 " + name[:20] + " · " + str(price) + "₽", callback_data="it:" + iid))
-    kb.row(B("💰 Скидка на все", callback_data="disc"), B("◀️", callback_data="menu"))
+    kb.row(B("➕ Создать лот", callback_data="cr_start"), B("💰 Скидка", callback_data="disc"))
+    kb.add(B("◀️", callback_data="menu"))
     send(cid, "\n".join(lines), kb)
 
 def show_item(cid, iid):
@@ -1132,7 +1218,7 @@ def show_item(cid, iid):
     st = g(it, "status", "state")
     st_s = str(getattr(st, "name", st) or "—")
     photos = item_photos(it)
-    L.info("show_item %s: photos=%d", iid[:12], len(photos))
+    L.info("show_item %s photos=%d", iid[:12], len(photos))
     lines = ["📦 <b>" + esc(name) + "</b>", "",
              "💰 Цена: <b>" + str(price) + "₽</b>",
              "📊 Статус: " + esc(st_s),
@@ -1141,7 +1227,7 @@ def show_item(cid, iid):
     kb = K(row_width=2)
     kb.row(B("💰 Цена", callback_data="edprice:" + iid), B("📝 Название", callback_data="edname:" + iid))
     kb.row(B("📄 Описание", callback_data="eddesc:" + iid), B("💸 Скидка", callback_data="disc1:" + iid))
-    kb.row(B("📷 Сменить фото", callback_data="edphoto:" + iid), B("📋 Копировать", callback_data="clone:" + iid))
+    kb.row(B("📷 Сменить фото", callback_data="edphoto:" + iid), B("🌐 Открыть", url=item_url(iid, it)))
     kb.add(B("◀️", callback_data="items:0"))
     txt = "\n".join(lines)
     if photos:
@@ -1207,6 +1293,25 @@ def handle_text(m):
                 USERS_STATE.setdefault("authorized", []).append(uid); save_users()
             bot.reply_to(m, "✅ Добро пожаловать! /start"); return
         bot.reply_to(m, "🔐 Введи пароль:"); return
+
+    # Черновик создания лота
+    d = DRAFT.get(str(m.chat.id))
+    if d:
+        step = d.get("step")
+        text = (m.text or "").strip()
+        if text.lower() in ("/cancel", "отмена"):
+            DRAFT.pop(str(m.chat.id), None); save_draft()
+            bot.reply_to(m, "❌ Отменено"); return
+        if step == "name":
+            okv, msg = guard_text(text, "названии")
+            if not okv: bot.reply_to(m, msg); return
+            start_price_input(m.chat.id, text); return
+        if step == "price":
+            try: p = int(float(text.replace(",", ".")))
+            except Exception: bot.reply_to(m, "❌ Число"); return
+            start_desc_input(m.chat.id, p); return
+        if step == "description":
+            finalize_draft(m.chat.id, text); return
 
     st = state.get(m.chat.id)
     a = st.get("action") if isinstance(st, dict) else st
@@ -1336,7 +1441,7 @@ def main():
             refresh_profile()
         except Exception as e: L.error("startup: %s", e)
     try:
-        notif("🚀 <b>" + INSTANCE_NAME + "</b> v" + BOT_VERSION + " · " + (GITHUB_REPO or "нет GitHub"))
+        notif("🚀 <b>" + INSTANCE_NAME + "</b> v" + BOT_VERSION)
     except Exception: pass
     L.info("telegram polling start")
     try:
