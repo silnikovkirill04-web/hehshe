@@ -1,6 +1,6 @@
-.#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v10.2 — стабильная версия."""
+"""KiriillBR Playerok Bot v10.2 — стабильная версия с фото."""
 import json, logging, os, re, sys, threading, time, urllib.request, subprocess, base64
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -92,7 +92,6 @@ GITHUB_BRANCH = CFG.get("github_branch", "main")
 GITHUB_FILE = CFG.get("github_file", "jehsbhw.py")
 INSTANCE_NAME = CFG.get("instance", "default")
 
-# Папка инстанса
 INST_DIR = os.path.join(BASE_DIR, INSTANCE_NAME)
 os.makedirs(INST_DIR, exist_ok=True)
 
@@ -108,7 +107,6 @@ SEEN_FILE     = os.path.join(INST_DIR, "seen.json")
 LOG_FILE      = os.path.join(INST_DIR, "bot.log")
 os.makedirs(PLUGINS_DIR, exist_ok=True)
 
-# Лог в файл
 try:
     fh = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=5, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
@@ -132,7 +130,6 @@ SET_D = jload(SETTINGS_FILE, {
 })
 DEALS_D = jload(DEALS_FILE, {})
 USERS_STATE = jload(USERS_FILE, {"authorized": []})
-# Авто-авторизация главного админа
 if MAIN_ADMIN and MAIN_ADMIN not in USERS_STATE.get("authorized", []):
     USERS_STATE.setdefault("authorized", []).append(MAIN_ADMIN)
     jsave(USERS_FILE, USERS_STATE)
@@ -250,9 +247,9 @@ def cookie_str():
         if x and x not in p: p.append(x)
     return ";".join(p)
 
-# ═══════════════════ ФОТО / URL — МНОГО СПОСОБОВ ═══════════════════
+# ═══════════════════ ФОТО / URL ═══════════════════
 def _to_url(x):
-    """Универсальная функция — превращает что угодно в URL."""
+    """Универсально превращает FileObject/строку/dict/list в URL."""
     if x is None: return ""
     if isinstance(x, str):
         s = x.strip()
@@ -260,12 +257,11 @@ def _to_url(x):
         if s.startswith("http"): return s
         if s.startswith("//"): return "https:" + s
         if s.startswith("/"): return "https://playerok.com" + s
-        if "." in s and " " not in s and len(s) < 300: return "https://playerok.com/" + s
+        if "." in s and " " not in s and len(s) < 400: return "https://playerok.com/" + s
         return ""
-    if isinstance(x, bytes):
-        return ""
+    if isinstance(x, bytes): return ""
     if isinstance(x, dict):
-        for k in ("url","link","href","src","path","file_url","fileUrl","preview_url","previewUrl","image_url","imageUrl","download_url","downloadUrl","cdn_url","cdnUrl"):
+        for k in ("url","link","href","src","path","preview_url","previewUrl","image_url","imageUrl","file_url","fileUrl","download_url","downloadUrl","cdn_url","cdnUrl"):
             u = _to_url(x.get(k))
             if u: return u
         for v in x.values():
@@ -275,30 +271,21 @@ def _to_url(x):
         for y in x:
             u = _to_url(y)
             if u: return u
-    # Прямые атрибуты (FileObject)
-    for attr in ("url","link","href","src","path","file_url","fileUrl","preview_url","previewUrl","image_url","imageUrl","download_url","downloadUrl","cdn_url","cdnUrl"):
+    # FileObject — берём .url
+    for attr in ("url","link","href","src","path","file_url","preview_url","image_url","download_url","cdn_url"):
         try:
             v = getattr(x, attr, None)
-            u = _to_url(v)
-            if u: return u
-        except Exception: continue
-    # __dict__
+            if v: return _to_url(v)
+        except Exception: pass
+    # vars()
     try:
-        d = vars(x)
-        for k, v in d.items():
+        for k, v in vars(x).items():
             if isinstance(v, str) and v.startswith("http"): return v
-        for k, v in d.items():
+        for v in vars(x).values():
             u = _to_url(v)
             if u: return u
     except Exception: pass
-    # __slots__
-    try:
-        for slot in getattr(x, "__slots__", []) or []:
-            v = getattr(x, slot, None)
-            u = _to_url(v)
-            if u: return u
-    except Exception: pass
-    # str / repr
+    # str/repr
     try:
         s = str(x)
         m = re.search(r"https?://[^\s\"'<>]+", s)
@@ -312,44 +299,41 @@ def _to_url(x):
     return ""
 
 def item_photos(it):
-    """Возвращает СПИСОК URL фото лота. Пробует очень много полей."""
-    out = []
-    seen = set()
-    def add(u):
-        u = _to_url(u)
+    """Возвращает список всех URL фото лота."""
+    out = []; seen = set()
+    def add(v):
+        u = _to_url(v)
         if u and u not in seen:
             seen.add(u); out.append(u)
-    # 1) Прямые поля
+    # прямые поля
     for f in ("attachment","attachments","images","photos","files","banner","image",
               "preview","thumbnail","picture","cover","main_image","photo",
               "media","gallery","screenshots","banners","pics","imgs",
               "image_url","imageUrl","photo_url","photoUrl","thumbnail_url"):
         v = g(it, f)
         if v: add(v)
-    # 2) raw / _raw / data / _data
+    # raw
     for ra in ("raw","_raw","data","_data","json","_json","payload","_payload"):
         try: raw = getattr(it, ra, None)
         except Exception: raw = None
         if raw is None and isinstance(it, dict): raw = it.get(ra)
-        if isinstance(raw, (dict, list)):
-            add(raw)
-    # 3) __dict__
+        if isinstance(raw, (dict, list)): add(raw)
+    # vars
     try:
         for k, v in vars(it).items():
             kl = str(k).lower()
             if any(t in kl for t in ("attach","image","photo","banner","pic","cover","preview","thumb","media")):
                 add(v)
     except Exception: pass
-    # 4) если it — dict
+    # dict
     if isinstance(it, dict):
         for k, v in it.items():
             kl = str(k).lower()
-            if any(t in kl for t in ("attach","image","photo","banner","pic","cover","preview","thumb","media")):
+            if any(t in kl for t in ("attach","image","photo","banner","pic","cover")):
                 add(v)
     return out
 
 def item_url(iid, it=None):
-    """Правильный URL лота на Playerok."""
     if it:
         for k in ("url","link","href","permalink","web_url","webUrl"):
             v = g(it, k)
@@ -499,7 +483,6 @@ def my_msg(m, chat=None):
     return False
 
 def mid(m):
-    """Много способов получить ID сообщения."""
     for f in ("id","message_id","msg_id","uid"):
         v = g(m, f)
         if v: return str(v)
@@ -742,8 +725,7 @@ def poller():
                     if SET_D.get("notify_messages", True):
                         kb = K(row_width=2).row(B("📜 15", callback_data="c:" + str(cid)), B("✍️ Ответ", callback_data="r:" + str(cid)))
                         notif("💬 <b>" + esc(nm) + "</b>\n" + esc(txt[:400]), kb)
-            if new_msgs:
-                save_seen()
+            if new_msgs: save_seen()
             try: refresh_profile()
             except Exception: pass
             conn["ok"] = True
@@ -782,8 +764,7 @@ def do_update(cid):
             send(cid, "❌ Файл слишком маленький"); return
         src_path = os.path.join(BASE_DIR, "pb.py")
         if os.path.exists(src_path):
-            import shutil
-            shutil.copy(src_path, src_path + ".bak")
+            import shutil; shutil.copy(src_path, src_path + ".bak")
         with open(src_path, "w", encoding="utf-8") as f: f.write(code)
         send(cid, "✅ Обновлено! Перезапускаю...")
         time.sleep(2)
@@ -823,7 +804,7 @@ def auto_update_worker():
         except Exception as e: L.warning("auto_update: %s", e)
         if stop.wait(6 * 3600): return
 
-# ═══════════════════ КОПИРОВАНИЕ ЛОТА ═══════════════════
+# ═══════════════════ СОЗДАНИЕ ЛОТА ═══════════════════
 def clone_item(cid, iid):
     try: it = acc.get_item(iid)
     except Exception as e:
@@ -1151,32 +1132,26 @@ def show_item(cid, iid):
     st = g(it, "status", "state")
     st_s = str(getattr(st, "name", st) or "—")
     photos = item_photos(it)
-    url = item_url(iid, it)
+    L.info("show_item %s: photos=%d", iid[:12], len(photos))
     lines = ["📦 <b>" + esc(name) + "</b>", "",
              "💰 Цена: <b>" + str(price) + "₽</b>",
              "📊 Статус: " + esc(st_s),
-             "🖼 Фото: <b>" + str(len(photos)) + "</b>"]
-    if url and "products/" in url:
-        lines.append("🌐 <a href=\"" + esc(url) + "\">Открыть на Playerok</a>")
-    lines += ["", "📝 " + esc(desc[:400])]
+             "🖼 Фото: <b>" + str(len(photos)) + "</b>",
+             "", "📝 " + esc(desc[:400])]
     kb = K(row_width=2)
     kb.row(B("💰 Цена", callback_data="edprice:" + iid), B("📝 Название", callback_data="edname:" + iid))
     kb.row(B("📄 Описание", callback_data="eddesc:" + iid), B("💸 Скидка", callback_data="disc1:" + iid))
     kb.row(B("📷 Сменить фото", callback_data="edphoto:" + iid), B("📋 Копировать", callback_data="clone:" + iid))
     kb.add(B("◀️", callback_data="items:0"))
     txt = "\n".join(lines)
-    # Показываем фото если есть
     if photos:
         for u in photos[:3]:
             try:
                 bot.send_photo(cid, u, caption=txt[:1024], reply_markup=kb, parse_mode="HTML")
+                L.info("send_photo OK: %s", u[:80])
                 return
             except Exception as e:
-                L.debug("send_photo %s: %s", u[:50], e)
-        # Если ничего не сработало — отправим ссылки
-        txt += "\n\n🖼 Фото:"
-        for u in photos[:5]:
-            txt += "\n• " + esc(u[:100])
+                L.warning("send_photo fail %s: %s", u[:60], e)
     send(cid, txt, kb)
 
 def show_ai(cid):
