@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v11.3 — поиск игр, ручной ввод, полный мастер."""
+"""KiriillBR Playerok Bot v11.4 — серверный поиск игр, загрузка всех через курсор."""
 import json, logging, os, re, sys, threading, time, urllib.request, base64
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-BOT_VERSION = "11.3"
+BOT_VERSION = "11.4"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -163,7 +163,7 @@ bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 acc = None
 stop = threading.Event()
 state = {}
-cache = {"chats": [], "ts": 0, "games": [], "games_ts": 0}
+cache = {"chats": [], "ts": 0, "games": [], "games_ts": 0, "games_cursor": None, "games_total": 0}
 conn = {"ok": False, "err": "", "method": ""}
 profile = {}
 seen_m = set(SEEN_D.get("msgs") or [])
@@ -307,9 +307,12 @@ def get_games(force=False):
     if not force and cache.get("games") and time.time() - cache.get("games_ts", 0) < 3600:
         return cache["games"]
     try:
-        r = acc.get_games()
+        r = acc.get_games(count=24)
         games = list(getattr(r, "games", None) or (r if isinstance(r, (list, tuple)) else []))
         cache["games"] = games; cache["games_ts"] = time.time()
+        cache["games_total"] = getattr(r, "total_count", 0)
+        pi = getattr(r, "page_info", None)
+        cache["games_cursor"] = getattr(pi, "end_cursor", None) if pi else None
         return games
     except Exception as e:
         L.warning("get_games: %s", e); return []
@@ -346,7 +349,6 @@ def deep_user(o, d=0, seen=None):
             r = deep_user(s, d+1, seen)
             if r: return r
     return ""
-
 def sender_name(chat, msg):
     cid = getattr(chat, "id", None) if chat else None
     n = chat_name(cid)
@@ -714,39 +716,107 @@ def draft_start(cid):
     save_draft()
     show_games(cid)
 
-def show_games(cid, force=False, page=0, query=None):
-    games = get_games(force=force)
-    if not games:
-        send(cid, "⏳ Загружаю игры...")
-        games = get_games(force=True)
-    if not games:
-        send(cid, "❌ Не удалось загрузить игры"); return
-    games_sorted = sorted(games, key=lambda x: str(g(x, "name", default="")).lower())
+def show_games(cid, force=False, page=0, query=None, load_all=False):
+    """Показывает игры.
+    - query: серверный поиск по названию
+    - load_all: грузит все игры через after_cursor (долго)
+    """
+    total_known = cache.get("games_total", 0)
+
     if query:
-        q = query.lower()
-        games_sorted = [x for x in games_sorted if q in str(g(x, "name", default="")).lower()]
+        try:
+            r = acc.get_games(name=query, count=24)
+            games = list(getattr(r, "games", []) or [])
+            total = getattr(r, "total_count", len(games))
+        except Exception as e:
+            send(cid, "❌ Ошибка поиска: " + esc(str(e)[:200])); return
+        kb = K(row_width=1)
+        for gm in games:
+            gid = str(g(gm, "id", "slug", default=""))
+            nm = sv(g(gm, "name"), "?")
+            kb.add(B("🎮 " + nm[:40], callback_data="cr_game:" + gid))
+        kb.row(B("🔍 Искать ещё", callback_data="cr_search"),
+               B("↩️ Все игры", callback_data="cr_games_all"))
+        kb.add(B("❌ Отмена", callback_data="cr_cancel"))
+        head = ("🔍 <b>Поиск: " + esc(query) + "</b>\n"
+                "🎮 Найдено: <b>" + str(total) + "</b> (показано " + str(len(games)) + ")\n\n")
+        if not games:
+            head += "❌ <i>Ничего не найдено</i>"
+        else:
+            head += "Выбери игру:"
+        send(cid, head, kb)
+        return
+
+    games = list(cache.get("games", []))
+
+    # Если просят загрузить всё
+    if load_all:
+        send(cid, "⏳ Загружаю все игры (может занять 30-60 сек)...")
+        all_games = []
+        cur = None
+        tries = 0
+        while tries < 60:
+            try:
+                r = acc.get_games(count=24, after_cursor=cur)
+                batch = list(getattr(r, "games", []) or [])
+                total_known = getattr(r, "total_count", total_known)
+                if not batch: break
+                all_games.extend(batch)
+                pi = getattr(r, "page_info", None)
+                cur = getattr(pi, "end_cursor", None) if pi else None
+                if not cur: break
+                tries += 1
+            except Exception as e:
+                L.warning("load all games err: %s", e); break
+        cache["games"] = all_games
+        cache["games_cursor"] = cur
+        cache["games_total"] = total_known
+        cache["games_ts"] = time.time()
+        games = all_games
+        send(cid, "✅ Загружено: <b>" + str(len(games)) + "</b>")
+
+    # Если ничего не загружено — грузим первую страницу
+    if not games:
+        try:
+            r = acc.get_games(count=24)
+            games = list(getattr(r, "games", []) or [])
+            pi = getattr(r, "page_info", None)
+            cache["games"] = games
+            cache["games_cursor"] = getattr(pi, "end_cursor", None) if pi else None
+            cache["games_total"] = getattr(r, "total_count", 0)
+            cache["games_ts"] = time.time()
+            total_known = cache["games_total"]
+        except Exception as e:
+            send(cid, "❌ " + esc(str(e)[:200])); return
+
+    # Показываем по 8 на страницу
     per_page = 8
-    chunk = games_sorted[page*per_page:(page+1)*per_page]
+    total_loaded = len(games)
+    slice_ = games[page*per_page:(page+1)*per_page]
+
     kb = K(row_width=1)
-    for gm in chunk:
+    for gm in slice_:
         gid = str(g(gm, "id", "slug", default=""))
         nm = sv(g(gm, "name"), "?")
         kb.add(B("🎮 " + nm[:40], callback_data="cr_game:" + gid))
+
     nav = []
     if page > 0: nav.append(B("⬅️", callback_data=f"cr_games_p:{page-1}"))
-    if (page+1)*per_page < len(games_sorted): nav.append(B("➡️", callback_data=f"cr_games_p:{page+1}"))
+    if (page+1)*per_page < total_loaded: nav.append(B("➡️", callback_data=f"cr_games_p:{page+1}"))
     if nav: kb.row(*nav)
-    kb.row(B("🔍 Поиск по названию", callback_data="cr_search"))
-    if query:
-        kb.row(B("↩️ Показать все", callback_data="cr_games_all"))
-    kb.row(B("🔄 Обновить", callback_data="cr_games_r"), B("❌ Отмена", callback_data="cr_cancel"))
-    head = "➕ <b>Создание лота</b>\n\n"
-    if query:
-        head += "🔍 Поиск: <b>" + esc(query) + "</b> · найдено: <b>" + str(len(games_sorted)) + "</b>\n\n"
-    else:
-        head += "🎮 Всего игр: <b>" + str(len(games_sorted)) + "</b> · стр. " + str(page+1) + "\n\n"
-    if not games_sorted:
-        head += "❌ <i>Ничего не найдено. Попробуй другой запрос.</i>"
+
+    if total_known and total_loaded < total_known:
+        kb.row(B("📥 Загрузить все (" + str(total_known) + ")", callback_data="cr_games_loadall"))
+    kb.row(B("🔍 Поиск по названию", callback_data="cr_search"),
+           B("🔄 Сброс", callback_data="cr_games_r"))
+    kb.add(B("❌ Отмена", callback_data="cr_cancel"))
+
+    pages_total = (total_loaded + per_page - 1) // per_page or 1
+    head = ("➕ <b>Создание лота</b>\n\n"
+            "🎮 Загружено: <b>" + str(total_loaded) + "</b> из <b>" + str(total_known) + "</b>\n"
+            "📄 Стр. <b>" + str(page+1) + "/" + str(pages_total) + "</b>\n\n")
+    if not slice_:
+        head += "❌ <i>Пусто</i>"
     else:
         head += "Выбери игру:"
     send(cid, head, kb)
@@ -1165,16 +1235,19 @@ def cb(c):
         DRAFT.pop(str(cid), None); save_draft()
         edit(cid, mid_, "❌ Отменено", K().add(B("◀️", callback_data="menu")))
     elif a == "cr_games_r":
+        cache["games"] = []; cache["games_cursor"] = None
         show_games(cid, force=True)
     elif a == "cr_games_all":
         show_games(cid)
+    elif a == "cr_games_loadall":
+        threading.Thread(target=lambda: show_games(cid, load_all=True), daemon=True).start()
     elif a.startswith("cr_games_p:"):
         try: p = int(a.split(":")[1])
         except Exception: p = 0
         show_games(cid, page=p)
     elif a == "cr_search":
         state[cid] = {"action": "cr_search"}
-        bot.send_message(cid, "🔍 Пришли название игры для поиска:\n\n/cancel — отмена")
+        bot.send_message(cid, "🔍 Пришли название игры:\n\n/cancel — отмена")
     elif a.startswith("cr_searchcat:"):
         game_id = a.split(":",1)[1]
         state[cid] = {"action": "cr_searchcat", "game_id": game_id}
@@ -1182,8 +1255,7 @@ def cb(c):
     elif a.startswith("cr_game:"):
         gid = a[8:]; show_categories(cid, gid)
     elif a.startswith("cr_cat_back:"):
-        game_id = a.split(":",1)[1]
-        show_categories(cid, game_id)
+        game_id = a.split(":",1)[1]; show_categories(cid, game_id)
     elif a == "cr_back_games":
         show_games(cid)
     elif a.startswith("cr_cat:"):
@@ -1205,8 +1277,7 @@ def cb(c):
             field, val = rest.split("=", 1)
             d = DRAFT.get(str(cid)) or {}
             d.setdefault("options_selected", {})[field] = val
-            save_draft()
-            next_options_field(cid)
+            save_draft(); next_options_field(cid)
     elif a == "cr_df_skip":
         d = DRAFT.get(str(cid)) or {}
         idx = d.get("current_df_idx", 0)
@@ -1398,7 +1469,6 @@ def handle_text(m):
             bot.reply_to(m, "✅ Добро пожаловать! /start"); return
         bot.reply_to(m, "🔐 Введи пароль:"); return
 
-    # Черновик
     d = DRAFT.get(str(m.chat.id))
     if d:
         step = d.get("step"); text = (m.text or "").strip()
@@ -1449,7 +1519,7 @@ def handle_text(m):
         threading.Thread(target=_t, daemon=True).start()
     elif a == "cr_search":
         state.pop(m.chat.id, None)
-        show_games(m.chat.id, force=False, query=(m.text or "").strip())
+        show_games(m.chat.id, query=(m.text or "").strip())
     elif a == "cr_searchcat":
         state.pop(m.chat.id, None)
         game_id = st.get("game_id")
@@ -1462,8 +1532,7 @@ def handle_text(m):
         cats = list(getattr(gm, "categories", []) or [])
         found = [c for c in cats if q in str(g(c, "name", default="")).lower()]
         if not found:
-            bot.reply_to(m, "❌ Не найдено. Напиши /start заново")
-            return
+            bot.reply_to(m, "❌ Не найдено"); return
         kb = K(row_width=1)
         for c in found:
             cid_ = str(g(c, "id", default=""))
