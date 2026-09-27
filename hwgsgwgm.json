@@ -1,3 +1,18 @@
-"github_repo": "silnikovkirill04-web/hehshe",
-"github_branch": "main",
-"github_file": "jehsbhw.py"
+{
+  "instance": "snahbshs",
+  "token": "8956504270:AAEXVj3UbXOwJyTv-SdQbXpicqSoDLH_zKs",
+  "admin_password": "пароль_придумай",
+  "admin_id": 1595538164,
+  "proxy": "",
+  "github_repo": "silnikovkirill04-web/hehshe",
+  "github_branch": "main",
+  "github_file": "jehsbhw.py",
+  "notify_messages": true,
+  "notify_deals": true,
+  "auto_confirm": false,
+  "auto_confirm_delay": 30,
+  "auto_bump": false,
+  "auto_bump_min": 240,
+  "auto_bump_max": 100,
+  "tmpl": "Здравствуйте, {buyer}! {message}"
+}
