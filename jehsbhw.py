@@ -1,74 +1,66 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v9.0 — самодостаточный, с обновлением через GitHub."""
-import json, logging, os, re, sys, threading, time, subprocess, urllib.request
+"""KiriillBR Playerok Bot v10.0 — мультиинстанс."""
+import json, logging, os, re, sys, threading, time, urllib.request, subprocess
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-# ============ CONFIG (создаётся при первом запуске) ============
-CONFIG_FILE = "config.json"
-LOG = "pb.log"
+# ═══════════════════════════════════════════════════════════
+#   МУЛЬТИИНСТАНС — ник для бота, отдельная папка
+# ═══════════════════════════════════════════════════════════
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+INSTANCE_FILE = os.path.join(BASE_DIR, ".instance")
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
+def get_instance():
+    env = os.environ.get("INSTANCE")
+    if env:
+        return env
+    if os.path.exists(INSTANCE_FILE):
         try:
-            with open(CONFIG_FILE, encoding="utf-8") as f:
-                return json.load(f)
+            with open(INSTANCE_FILE, encoding="utf-8") as f:
+                n = f.read().strip()
+            if n:
+                return n
         except Exception:
             pass
-    return {}
+    return None
 
-def save_config(cfg):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+def set_instance(nick):
+    nick = re.sub(r"[^A-Za-z0-9_\-]", "_", str(nick))[:32]
+    if not nick:
+        raise ValueError("Пустой ник")
+    with open(INSTANCE_FILE, "w", encoding="utf-8") as f:
+        f.write(nick)
+    os.makedirs(os.path.join(BASE_DIR, nick), exist_ok=True)
+    return nick
 
-def setup_wizard():
-    """Интерактивная настройка при первом запуске."""
-    print("=" * 60)
-    print("  Первый запуск — настройка")
-    print("=" * 60)
-    cfg = {}
-    print()
-    print("1. Токен бота (получить у @BotFather в Telegram)")
-    cfg["token"] = input("   Токен: ").strip()
-    print()
-    print("2. Пароль для входа в бота (придумай любой)")
-    cfg["admin_password"] = input("   Пароль: ").strip()
-    print()
-    print("3. Telegram ID админа (число, можно узнать у @userinfobot)")
-    try:
-        cfg["admin_id"] = int(input("   ID: ").strip())
-    except ValueError:
-        cfg["admin_id"] = 0
-    print()
-    print("4. Прокси (SOCKS5/HTTP) — можно оставить пустым")
-    print("   Формат: socks5://user:pass@host:port или http://host:port")
-    p = input("   Прокси [Enter=пропустить]: ").strip()
-    cfg["proxy"] = p
-    print()
-    print("5. GitHub репо для авто-обновления (owner/repo)")
-    print("   Например: alleexxeeyy/PlayerokAPI  → для обновления этого бота свой")
-    repo = input("   owner/repo [Enter=пропустить]: ").strip()
-    cfg["github_repo"] = repo
-    cfg["github_branch"] = "main"
-    cfg["notify_messages"] = True
-    cfg["notify_deals"] = True
-    cfg["auto_confirm"] = False
-    cfg["auto_confirm_delay"] = 30
-    cfg["auto_bump"] = False
-    cfg["auto_bump_min"] = 240
-    cfg["auto_bump_max"] = 100
-    cfg["tmpl"] = "Здравствуйте, {buyer}! {message}"
-    save_config(cfg)
-    print()
-    print("=" * 60)
-    print("  ✅ Настройки сохранены в config.json")
-    print("=" * 60)
-    return cfg
+def instance_dir():
+    n = get_instance()
+    return os.path.join(BASE_DIR, n) if n else BASE_DIR
 
-# ============ ЛОГИ ============
+INST_DIR = instance_dir()
+os.makedirs(INST_DIR, exist_ok=True)
+
+# Все файлы — в папке инстанса
+CONFIG_FILE   = os.path.join(INST_DIR, "config.json")
+CREDS_FILE    = os.path.join(INST_DIR, "creds.json")
+SETTINGS_FILE = os.path.join(INST_DIR, "settings.json")
+DEALS_FILE    = os.path.join(INST_DIR, "deals.json")
+USERS_FILE    = os.path.join(INST_DIR, "users.json")
+AI_FILE       = os.path.join(INST_DIR, "ai_config.json")
+NAMES_FILE    = os.path.join(INST_DIR, "chatnames.json")
+PLUGINS_FILE  = os.path.join(INST_DIR, "plugins.json")
+PLUGINS_DIR   = os.path.join(INST_DIR, "plugins")
+SEEN_FILE     = os.path.join(INST_DIR, "seen.json")
+LOG_FILE      = os.path.join(INST_DIR, "bot.log")
+
+os.makedirs(PLUGINS_DIR, exist_ok=True)
+
+# ═══════════════════════════════════════════════════════════
+#   ЛОГИ
+# ═══════════════════════════════════════════════════════════
 def setup_logging():
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
@@ -82,52 +74,21 @@ def setup_logging():
     ch.setFormatter(fmt)
     root.addHandler(ch)
     try:
-        fh = RotatingFileHandler(LOG, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+        fh = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=5, encoding="utf-8")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(fmt)
         root.addHandler(fh)
     except Exception as e:
-        print("log fail:", e)
+        print("log:", e)
     for n in ("urllib3", "requests", "curl_cffi", "telebot", "playerokapi", "charset_normalizer"):
         logging.getLogger(n).setLevel(logging.WARNING)
 
 setup_logging()
 L = logging.getLogger("Bot")
 
-# ============ LOAD CONFIG ============
-CFG = load_config()
-if not CFG.get("token") or not CFG.get("admin_password"):
-    CFG = setup_wizard()
-
-TOKEN = CFG["token"]
-ADMIN_PASSWORD = CFG["admin_password"]
-MAIN_ADMIN = int(CFG.get("admin_id") or 0)
-PROXY = CFG.get("proxy", "")
-GITHUB_REPO = CFG.get("github_repo", "")
-GITHUB_BRANCH = CFG.get("github_branch", "main")
-GITHUB_FILE = "pb.py"
-
-# ============ ПРОКСИ для Telegram ============
-if PROXY:
-    try:
-        telebot.apihelper.proxy = {"http": PROXY, "https": PROXY}
-        L.info("Прокси для Telegram: %s", PROXY)
-    except Exception as e:
-        L.warning("Прокси не применён: %s", e)
-
-# ============ ХРАНИЛИЩА ============
-CREDS_FILE = "creds.json"
-SETTINGS_FILE = "settings.json"
-DEALS_FILE = "deals.json"
-USERS_FILE = "users.json"
-AI_FILE = "ai_config.json"
-NAMES_FILE = "chatnames.json"
-PLUGINS_FILE = "plugins.json"
-PLUGINS_DIR = "plugins"
-SEEN_FILE = "seen.json"
-
-os.makedirs(PLUGINS_DIR, exist_ok=True)
-
+# ═══════════════════════════════════════════════════════════
+#   JSON helpers
+# ═══════════════════════════════════════════════════════════
 def jload(p, d):
     try:
         with open(p, encoding="utf-8") as f:
@@ -143,6 +104,91 @@ def jsave(p, d):
     except Exception as e:
         L.error("save %s: %s", p, e)
 
+def save_config(c):
+    jsave(CONFIG_FILE, c)
+
+# ═══════════════════════════════════════════════════════════
+#   ВИЗАРД ПЕРВОГО ЗАПУСКА
+# ═══════════════════════════════════════════════════════════
+def setup_wizard():
+    global INST_DIR, CONFIG_FILE
+    print("=" * 60)
+    print("  Первый запуск KiriillBR Playerok Bot")
+    print("=" * 60)
+    print()
+
+    # Ник инстанса
+    while True:
+        nick = input("Придумай ник для бота (латиница/цифры/_-): ").strip()
+        if not nick:
+            print("Пустой — ещё раз")
+            continue
+        try:
+            nick = set_instance(nick)
+            break
+        except Exception as e:
+            print("Ошибка:", e)
+
+    # Пересчёт путей после создания папки
+    INST_DIR = instance_dir()
+    CONFIG_FILE = os.path.join(INST_DIR, "config.json")
+    print()
+    print("📁 Инстанс:", nick)
+    print("📁 Папка:  ", INST_DIR)
+    print()
+
+    cfg = {"instance": nick}
+    cfg["token"] = input("1. Токен бота (от @BotFather): ").strip()
+    cfg["admin_password"] = input("2. Пароль для входа: ").strip()
+    try:
+        cfg["admin_id"] = int(input("3. Твой Telegram ID (у @userinfobot): ").strip())
+    except ValueError:
+        cfg["admin_id"] = 0
+    cfg["proxy"] = input("4. Прокси (SOCKS5/HTTP) [Enter=нет]: ").strip()
+    cfg["github_repo"] = input("5. GitHub owner/repo [Enter=нет]: ").strip() or "silnikovkirill04-web/hehshe"
+    cfg["github_branch"] = "main"
+    cfg["github_file"] = "jehsbhw.py"
+    cfg["notify_messages"] = True
+    cfg["notify_deals"] = True
+    cfg["auto_confirm"] = False
+    cfg["auto_confirm_delay"] = 30
+    cfg["auto_bump"] = False
+    cfg["auto_bump_min"] = 240
+    cfg["auto_bump_max"] = 100
+    cfg["tmpl"] = "Здравствуйте, {buyer}! {message}"
+
+    save_config(cfg)
+    print()
+    print("=" * 60)
+    print("  ✅ Сохранено в:", CONFIG_FILE)
+    print("=" * 60)
+    print()
+    return cfg
+
+CFG = jload(CONFIG_FILE, {})
+if not CFG.get("token") or not CFG.get("admin_password"):
+    CFG = setup_wizard()
+
+TOKEN = CFG["token"]
+ADMIN_PASSWORD = CFG.get("admin_password", "")
+MAIN_ADMIN = int(CFG.get("admin_id") or 0)
+PROXY = CFG.get("proxy", "")
+GITHUB_REPO = CFG.get("github_repo", "")
+GITHUB_BRANCH = CFG.get("github_branch", "main")
+GITHUB_FILE = CFG.get("github_file", "jehsbhw.py")
+INSTANCE_NAME = CFG.get("instance", "default")
+
+# Прокси для Telegram
+if PROXY:
+    try:
+        telebot.apihelper.proxy = {"http": PROXY, "https": PROXY}
+        L.info("Telegram proxy: %s", PROXY)
+    except Exception as e:
+        L.warning("proxy: %s", e)
+
+# ═══════════════════════════════════════════════════════════
+#   ХРАНИЛИЩА
+# ═══════════════════════════════════════════════════════════
 CREDS = jload(CREDS_FILE, {"cookies": "", "token": "", "ddg5": ""})
 SET_D = jload(SETTINGS_FILE, {
     "notify_messages": True, "notify_deals": True,
@@ -151,7 +197,7 @@ SET_D = jload(SETTINGS_FILE, {
     "tmpl": "Здравствуйте, {buyer}! {message}",
 })
 DEALS_D = jload(DEALS_FILE, {})
-USERS_STATE = jload(USERS_FILE, {"authorized": []})
+USERS_STATE = jload(USERS_FILE, {"authorized": [], "passwords": {}})
 AI_CONFIG = jload(AI_FILE, {
     "enabled": False, "provider": "gemini", "api_key": "", "model": "", "strict": True,
 })
@@ -168,9 +214,11 @@ def save_names(): jsave(NAMES_FILE, NAMES_D)
 def save_plugs(): jsave(PLUGINS_FILE, PLUGS_D)
 def save_seen(): jsave(SEEN_FILE, SEEN_D)
 
-# ============ СЛУЖЕБНЫЕ ЧАТЫ Playerok ============
+# ═══════════════════════════════════════════════════════════
+#   СЛУЖЕБНЫЕ ЧАТЫ
+# ═══════════════════════════════════════════════════════════
 SUPPORT_IDS = {"1f1b989c-c8ff-62c2-61ae-6f0b6ec96725": "🆘 Поддержка"}
-SYSTEM_IDS = {"1f1b989c-c8ff-62c0-0a0c-5c6c06252a37": "⚙️ Система"}
+SYSTEM_IDS  = {"1f1b989c-c8ff-62c0-0a0c-5c6c06252a37": "⚙️ Система"}
 
 def norm(s):
     return "".join(c for c in str(s or "").lower() if c not in " \t\n\r-_")
@@ -190,7 +238,9 @@ def chat_name(cid):
             return v
     return None
 
-# ============ PLAYEROKAPI ============
+# ═══════════════════════════════════════════════════════════
+#   PLAYEROKAPI
+# ═══════════════════════════════════════════════════════════
 OK = False
 Account = None
 BotCheck = Unauth = Exception
@@ -203,16 +253,9 @@ try:
 except Exception as e:
     L.error("playerokapi: %s", e)
 
-try:
-    from playerokapi.listener.listener import EventListener
-    from playerokapi.enums import EventTypes
-    L.info("EventListener OK")
-except Exception as e:
-    EventListener = None
-    EventTypes = None
-    L.warning("EventListener: %s", e)
-
-# ============ СОСТОЯНИЕ ============
+# ═══════════════════════════════════════════════════════════
+#   СОСТОЯНИЕ
+# ═══════════════════════════════════════════════════════════
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 acc = None
 stop = threading.Event()
@@ -226,7 +269,9 @@ last_bump = {"ts": 0}
 plugin_apis = {}
 ucache = {}
 
-# ============ ХЕЛПЕРЫ ============
+# ═══════════════════════════════════════════════════════════
+#   ХЕЛПЕРЫ
+# ═══════════════════════════════════════════════════════════
 def esc(s):
     return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -246,12 +291,19 @@ def g(o, *attrs, default=None):
             continue
     return default
 
+def is_authorized(uid):
+    if uid == MAIN_ADMIN:
+        return True
+    if uid in USERS_STATE.get("authorized", []):
+        return True
+    return False
+
 def adm(m):
     try:
         uid = int(m.chat.id)
     except Exception:
         return False
-    return uid == MAIN_ADMIN or uid in USERS_STATE.get("authorized", [])
+    return is_authorized(uid)
 
 def send(cid, text, kb=None):
     try:
@@ -290,7 +342,9 @@ def cookie_str():
             p.append(x)
     return ";".join(p)
 
-# ============ PLAYEROK API ============
+# ═══════════════════════════════════════════════════════════
+#   PLAYEROK API
+# ═══════════════════════════════════════════════════════════
 def get_chats():
     if acc is None:
         return []
@@ -340,7 +394,9 @@ def refresh_profile():
     except Exception:
         pass
 
-# ============ НИКИ ============
+# ═══════════════════════════════════════════════════════════
+#   НИКИ
+# ═══════════════════════════════════════════════════════════
 UF = ("username", "nickname", "name", "login", "display_name")
 UH = ("user", "author", "sender", "from_user", "from", "companion", "interlocutor", "buyer", "peer")
 
@@ -477,7 +533,9 @@ def mid(m):
         return "h%d:%s" % (hash(t), ts)
     return ""
 
-# ============ AI ============
+# ═══════════════════════════════════════════════════════════
+#   AI ПРОВЕРКА
+# ═══════════════════════════════════════════════════════════
 AI_DEFAULTS = {
     "openai": ("https://api.openai.com/v1/chat/completions", "gpt-4o-mini"),
     "anthropic": ("https://api.anthropic.com/v1/messages", "claude-3-5-sonnet-latest"),
@@ -498,7 +556,7 @@ AI_PROMPT = """Проверь изображение на нарушения п�
 6. Оформление: имитация офиц. магазина Playerok, мат, оскорбления, политика, экстремизм
 7. Недостоверность: случайная игра, рандом, от 1 до 10, прайс-лист, каталог, бартер, обмен
 
-РАЗРЕШЕНО: игровые скриншоты, логотипы игр, стикеры/эмодзи, молния ⚡ и 🔥⭐🎮💰, персонажи аниме/игр, инструкции, "гарантия 48 часов" и больше, "быстро", "premium", цены
+РАЗРЕШЕНО: игровые скриншоты, логотипы игр, стикеры/эмодзи, молния ⚡, 🔥, ⭐, 🎮, 💰, персонажи аниме/игр, инструкции, "гарантия 48 часов" и больше, "быстро", "premium", цены
 
 ОТВЕТ: строго OK или BAD: <список>"""
 
@@ -595,16 +653,6 @@ def ai_check_text(text):
         L.warning("AI txt: %s", str(e)[:150])
         return True, ""
 
-def guard_text(text, label="текст"):
-    ok, hits = validate_text(text)
-    if ok:
-        return True, ""
-    uniq = list(dict.fromkeys(hits))
-    msg = ("⚠️ <b>Заблокировано правилами</b>" + chr(10) + chr(10) +
-           "В " + label + ": <b>" + ", ".join(uniq) + "</b>" + chr(10) + chr(10) +
-           "Правила: playerok.com/terms-of-sale")
-    return False, msg
-
 def guard_photo(data, mime="image/jpeg", label="фото"):
     if not AI_CONFIG.get("enabled"):
         return True, ""
@@ -612,23 +660,24 @@ def guard_photo(data, mime="image/jpeg", label="фото"):
     if ok:
         return True, ""
     if AI_CONFIG.get("strict", True):
-        return False, ("⚠️ <b>На " + label + " нарушения</b>" + chr(10) + chr(10) +
-                       "<b>" + esc(reason[:400]) + "</b>" + chr(10) + chr(10) +
-                       "Замени фото.")
+        return False, ("⚠️ <b>На " + label + " нарушения</b>\n\n" +
+                       "<b>" + esc(reason[:400]) + "</b>\n\nЗамени фото.")
     notif("⚠️ <b>" + label + ":</b> " + esc(reason[:300]))
     return True, ""
 
-# ============ ЗАЩИТА ТЕКСТА ============
+# ═══════════════════════════════════════════════════════════
+#   ЗАЩИТА ТЕКСТА
+# ═══════════════════════════════════════════════════════════
 import re as _reg
 
 BANNED_PATTERNS = [
     (r"\+?\d[\d\s\-()]{9,}", "телефон"),
     (r"\b[\w.+-]+@[\w-]+\.[\w.-]+", "email"),
     (r"@[A-Za-z][A-Za-z0-9_]{3,}", "@ник"),
-    (r"\b(telegram|телеграм|телега|тг|tg|whatsapp|ватсап|viber|вайбер|discord|дискорд)\b", "мессенджер"),
-    (r"\b(t\.me|wa\.me|vk\.com|insta(gram)?|инстаграм)\b", "соцсеть"),
-    (r"\b(сбер|тинькоф|т-банк|втб|сбп|qiwi|юмани|paypal|usdt|btc|bitcoin|крипта)\b", "платёжка/крипта"),
-    (r"\b(напрямую|в\s+лс|в\s+личк[уе]|без\s+комисси|обойти\s+комисси|вне\s+сайта)\b", "обход комиссии"),
+    (r"\b(telegram|телеграм|тг|tg|whatsapp|ватсап|viber|вайбер|discord|дискорд)\b", "мессенджер"),
+    (r"\b(t\.me|wa\.me|vk\.com|insta(gram)?)\b", "соцсеть"),
+    (r"\b(сбер|тинькоф|втб|сбп|qiwi|юмани|paypal|usdt|btc|bitcoin|крипта)\b", "платёжка/крипта"),
+    (r"\b(напрямую|в\s+лс|в\s+личк[уе]|без\s+комисси|вне\s+сайта)\b", "обход комиссии"),
     (r"\b(переводом\s+на\s+карт|на\s+карту|оплата\s+напрямую)\b", "оплата вне сайта"),
     (r"\bгарант\w*\b", "гарантия"),
     (r"\b(пожизненн|вечн|навсегда|бессрочн)\w*\s+гарант", "пожизненная гарантия"),
@@ -661,14 +710,24 @@ def validate_text(text):
                 hits.append(name)
         except Exception:
             continue
-    # Исключение: "гарантия 48 часов" и больше
     if "гарантия" in hits:
         allowed = _reg.search(r"гарант\w*\s+(?:на\s+)?(\d{2,}|48|72|90|180|365)\s*(?:час|ч|дн|дней|мес|год)", t)
         if allowed and not _reg.search(r"пожизн|навсегда|вечн|бессрочн|100%", t):
             hits = [h for h in hits if h != "гарантия"]
     return len(hits) == 0, hits
 
-# ============ LEGAL BLOCK ============
+def guard_text(text, label="текст"):
+    ok, hits = validate_text(text)
+    if ok:
+        return True, ""
+    uniq = list(dict.fromkeys(hits))
+    msg = ("⚠️ <b>Заблокировано правилами</b>\n\nВ " + label + ": <b>" +
+           ", ".join(uniq) + "</b>\n\nПравила: playerok.com/terms-of-sale")
+    return False, msg
+
+# ═══════════════════════════════════════════════════════════
+#   LEGAL
+# ═══════════════════════════════════════════════════════════
 LEGAL_FOOTER = (
     "\n\n━━━━━━━━━━━━━━━━━━\n"
     "Условия продажи: playerok.com/terms-of-sale\n"
@@ -684,7 +743,9 @@ def legal_wrap(d):
         return d
     return d + LEGAL_FOOTER
 
-# ============ ПОДКЛЮЧЕНИЕ ============
+# ═══════════════════════════════════════════════════════════
+#   ПОДКЛЮЧЕНИЕ
+# ═══════════════════════════════════════════════════════════
 def connect():
     global acc
     if not OK:
@@ -721,7 +782,9 @@ def connect():
             errs.append(n + ": " + str(e)[:100])
     raise RuntimeError(" | ".join(errs))
 
-# ============ POLLER ============
+# ═══════════════════════════════════════════════════════════
+#   POLLER
+# ═══════════════════════════════════════════════════════════
 def poller():
     global cache
     L.info("poller started")
@@ -731,7 +794,7 @@ def poller():
             try:
                 connect()
                 back = 5
-                notif("🟢 Подключён (" + conn.get("method", "") + ")")
+                notif("🟢 " + INSTANCE_NAME + " подключён (" + conn.get("method", "") + ")")
             except Exception as e:
                 L.error("connect: %s", str(e)[:200])
                 if stop.wait(back):
@@ -796,42 +859,53 @@ def on_deal(d):
     save_deals()
     em = {"PAID": "💳", "CONFIRMED": "✅", "CANCELED": "❌"}.get(st, "🛒")
     if SET_D.get("notify_deals", True):
-        notif(em + " <b>Сделка " + esc(did[:16]) + "</b>\n👤 " + esc(buyer) + " · " + str(round(price)) + "₽ · " + esc(st))
+        notif(em + " <b>Сделка " + esc(did[:16]) + "</b>\n👤 " + esc(buyer) +
+              " · " + str(round(price)) + "₽ · " + esc(st))
 
-# ============ PLUGINS ============
-def load_plugin(uuid, path):
+# ═══════════════════════════════════════════════════════════
+#   ОБНОВЛЕНИЕ С GITHUB
+# ═══════════════════════════════════════════════════════════
+def do_update(cid):
+    if not GITHUB_REPO:
+        send(cid, "❌ GitHub репозиторий не настроен")
+        return
     try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("pl_" + uuid, path)
-        mod = importlib.util.module_from_spec(spec)
-        api = type("A", (), {})()
-        api.bot = bot
-        api.send_admin = notif
-        api.get_account = lambda: acc
-        api._callbacks = {}
-        api._menu_buttons = []
-        api.callback = lambda a, fn: api._callbacks.__setitem__(a, fn)
-        api.add_menu_button = lambda t, a: api._menu_buttons.append((t, a))
-        plugin_apis[uuid] = api
-        mod.api = api
-        spec.loader.exec_module(mod)
-        if hasattr(mod, "register"):
-            mod.register(api)
-        return True, ""
+        url = "https://raw.githubusercontent.com/" + GITHUB_REPO + "/" + GITHUB_BRANCH + "/" + GITHUB_FILE
+        L.info("update: %s", url)
+        opener = urllib.request.build_opener()
+        if PROXY:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": PROXY, "https": PROXY}))
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with opener.open(req, timeout=30) as r:
+            code = r.read().decode("utf-8")
+        if len(code) < 1000:
+            send(cid, "❌ Файл слишком маленький")
+            return
+        src_path = os.path.join(BASE_DIR, "pb.py")
+        if os.path.exists(src_path):
+            import shutil
+            shutil.copy(src_path, src_path + ".bak")
+        with open(src_path, "w", encoding="utf-8") as f:
+            f.write(code)
+        send(cid, "✅ Обновлено! Перезапускаю...")
+        time.sleep(2)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception as e:
-        L.exception("plugin %s", uuid)
-        plugin_apis.pop(uuid, None)
-        return False, str(e)
+        L.exception("update")
+        send(cid, "❌ " + esc(str(e)[:200]))
 
-# ============ UI ============
+# ═══════════════════════════════════════════════════════════
+#   UI
+# ═══════════════════════════════════════════════════════════
 def main_kb():
     kb = K(row_width=2)
-    kb.row(B("🔌 Подключение", callback_data="conn"), B("🧩 Плагины", callback_data="pluglist:0"))
-    kb.row(B("📨 Чаты", callback_data="chats"), B("🔔 Уведомления", callback_data="notify"))
-    kb.row(B("📋 Сделки", callback_data="deals"), B("⚡ Автоподнятие", callback_data="bump"))
-    kb.row(B("📦 Мои лоты", callback_data="items:0"), B("👤 Профиль", callback_data="prof"))
-    kb.row(B("🤖 AI-проверка", callback_data="ai"), B("⚙️ Настройки", callback_data="set"))
-    kb.row(B("🔄 Обновить", callback_data="menu"), B("🛠 Обновить бота", callback_data="update"))
+    kb.row(B("🔌 Подключение", callback_data="conn"), B("📨 Чаты", callback_data="chats"))
+    kb.row(B("🔔 Уведомления", callback_data="notify"), B("📋 Сделки", callback_data="deals"))
+    kb.row(B("⚡ Автоподнятие", callback_data="bump"), B("📦 Мои лоты", callback_data="items:0"))
+    kb.row(B("👤 Профиль", callback_data="prof"), B("🤖 AI-проверка", callback_data="ai"))
+    kb.row(B("⚙️ Настройки", callback_data="set"), B("🛠 Обновить", callback_data="update"))
+    kb.row(B("🔄 Обновить меню", callback_data="menu"))
     return kb
 
 def main_text():
@@ -841,20 +915,23 @@ def main_text():
         except Exception:
             pass
     conn_e = "🟢" if conn.get("ok") else "🔴"
+    head = "🤖 <b>Playerok Bot</b> · <b>" + esc(INSTANCE_NAME) + "</b> · " + conn_e
     if acc is None:
-        return "🤖 <b>Playerok Bot v9.0</b> · " + conn_e + "\n👤 Не подключён"
+        return head + "\n👤 Не подключён"
     d = profile or {}
-    return ("🤖 <b>Playerok Bot v9.0</b> · " + conn_e + "\n" +
+    return (head + "\n" +
             "👤 <b>" + esc(d.get("username") or "—") + "</b>\n" +
             "🆔 <code>" + esc(d.get("id") or "—") + "</code>\n" +
-            "🛒 Сделок: <b>" + str(len(DEALS_D)) + "</b>\n" +
-            "📨 Чатов: <b>" + str(len(cache.get("chats", []))) + "</b>")
+            "🛒 Сделок: <b>" + str(len(DEALS_D)) + "</b> · 📨 Чатов: <b>" +
+            str(len(cache.get("chats", []))) + "</b>")
 
-# ============ COMMANDS ============
+# ═══════════════════════════════════════════════════════════
+#   КОМАНДЫ
+# ═══════════════════════════════════════════════════════════
 @bot.message_handler(commands=["start", "menu"])
 def cmd_start(m):
     if not adm(m):
-        bot.reply_to(m, "⛔ Нет доступа")
+        bot.reply_to(m, "⛔ Нет доступа. Введи пароль.")
         return
     state.pop(m.chat.id, None)
     bot.send_message(m.chat.id, main_text(), reply_markup=main_kb())
@@ -877,48 +954,17 @@ def cmd_restart(m):
 def cmd_update(m):
     if not adm(m):
         return
-    if not GITHUB_REPO:
-        bot.reply_to(m, "❌ GitHub репозиторий не настроен. Добавь в config.json:\n<code>\"github_repo\": \"owner/repo\"</code>")
-        return
-    bot.reply_to(m, "📥 Скачиваю новый код...")
+    bot.reply_to(m, "📥 Скачиваю новый код с GitHub...")
     threading.Thread(target=do_update, args=(m.chat.id,), daemon=True).start()
-
-def do_update(cid):
-    try:
-        url = "https://raw.githubusercontent.com/" + GITHUB_REPO + "/" + GITHUB_BRANCH + "/" + GITHUB_FILE
-        L.info("update from %s", url)
-        if PROXY:
-            proxy_handler = urllib.request.ProxyHandler({"http": PROXY, "https": PROXY})
-            opener = urllib.request.build_opener(proxy_handler)
-        else:
-            opener = urllib.request.build_opener()
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with opener.open(req, timeout=30) as r:
-            new_code = r.read().decode("utf-8")
-        if len(new_code) < 1000:
-            bot.send_message(cid, "❌ Файл слишком маленький")
-            return
-        # Резервная копия
-        import shutil
-        if os.path.exists("pb.py"):
-            shutil.copy("pb.py", "pb.py.bak")
-        with open("pb.py", "w", encoding="utf-8") as f:
-            f.write(new_code)
-        bot.send_message(cid, "✅ Обновлено! Перезапускаю...")
-        time.sleep(2)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-    except Exception as e:
-        L.exception("update")
-        bot.send_message(cid, "❌ Ошибка: " + esc(str(e)[:200]))
 
 @bot.message_handler(commands=["log"])
 def cmd_log(m):
     if not adm(m):
         return
     try:
-        with open(LOG, encoding="utf-8") as f:
+        with open(LOG_FILE, encoding="utf-8") as f:
             lines = f.readlines()[-300:]
-        p = "log_tail.txt"
+        p = os.path.join(INST_DIR, "log_tail.txt")
         with open(p, "w", encoding="utf-8") as f:
             f.writelines(lines)
         with open(p, "rb") as f:
@@ -931,10 +977,12 @@ def cmd_cancel(m):
     state.pop(m.chat.id, None)
     bot.reply_to(m, "❌ Отменено")
 
-# ============ CALLBACKS ============
+# ═══════════════════════════════════════════════════════════
+#   CALLBACKS
+# ═══════════════════════════════════════════════════════════
 @bot.callback_query_handler(func=lambda c: True)
 def cb(c):
-    if int(c.from_user.id) != MAIN_ADMIN and int(c.from_user.id) not in USERS_STATE.get("authorized", []):
+    if not is_authorized(int(c.from_user.id)):
         try:
             bot.answer_callback_query(c.id, "⛔")
         except Exception:
@@ -981,13 +1029,11 @@ def cb(c):
             try:
                 connect()
                 refresh_profile()
-                notif("🟢 Переподключено")
+                notif("🟢 " + INSTANCE_NAME + " переподключён")
             except Exception as e:
                 notif("❌ " + esc(str(e)[:200]))
         threading.Thread(target=_r, daemon=True).start()
-    elif a == "chats":
-        show_chats(cid, True)
-    elif a == "chats_load":
+    elif a == "chats" or a == "chats_load":
         show_chats(cid, True)
     elif a.startswith("c:"):
         show_history(cid, a[2:])
@@ -1003,12 +1049,14 @@ def cb(c):
         if k in SET_D:
             SET_D[k] = not SET_D[k]
             save_set()
-        show_notify(cid)
+        if k in ("notify_messages", "notify_deals", "auto_confirm"):
+            show_notify(cid)
     elif a == "bump":
         show_bump(cid)
     elif a.startswith("cyc:"):
         k = a[4:]
-        cyc = {"auto_bump_min": [60, 120, 240, 480, 720], "auto_bump_max": [10, 50, 100, 500, 1000],
+        cyc = {"auto_bump_min": [60, 120, 240, 480, 720],
+               "auto_bump_max": [10, 50, 100, 500, 1000],
                "auto_confirm_delay": [10, 30, 60, 120, 300]}
         if k in cyc:
             try:
@@ -1030,8 +1078,8 @@ def cb(c):
         send(cid, txt, K().add(B("◀️", callback_data="menu")))
     elif a == "set":
         lines = ["⚙️ <b>Настройки</b>", "",
-                 "🎫 token/ddg5: <b>" + str(len(token_pk())) + "/" + str(len(ddg5())) + "</b>",
-                 "🌐 прокси: " + (PROXY if PROXY else "нет"),
+                 "🆔 Инстанс: <b>" + esc(INSTANCE_NAME) + "</b>",
+                 "📁 Папка: <code>" + esc(INST_DIR) + "</code>",
                  "🔗 GitHub: " + (GITHUB_REPO if GITHUB_REPO else "не настроен")]
         kb = K(row_width=1)
         kb.add(B("🛠 Обновить бота", callback_data="update"))
@@ -1040,9 +1088,6 @@ def cb(c):
         kb.add(B("◀️", callback_data="menu"))
         edit(cid, mid_, "\n".join(lines), kb)
     elif a == "update":
-        if not GITHUB_REPO:
-            bot.send_message(cid, "❌ GitHub не настроен")
-            return
         bot.send_message(cid, "📥 Скачиваю...")
         threading.Thread(target=do_update, args=(cid,), daemon=True).start()
     elif a == "restart":
@@ -1113,6 +1158,9 @@ def cb(c):
     else:
         L.warning("CB unhandled: %r", a)
 
+# ═══════════════════════════════════════════════════════════
+#   SHOW
+# ═══════════════════════════════════════════════════════════
 def show_chats(cid, refresh=False):
     global cache
     if acc is None:
@@ -1303,12 +1351,27 @@ def ai_ping_task(cid):
     except Exception as e:
         send(cid, "❌ " + esc(str(e)[:250]))
 
-# ============ TEXT HANDLER ============
+# ═══════════════════════════════════════════════════════════
+#   TEXT
+# ═══════════════════════════════════════════════════════════
 @bot.message_handler(content_types=["text"])
 def handle_text(m):
-    if not adm(m):
-        bot.reply_to(m, "⛔")
-        return
+    uid = int(m.chat.id) if m.chat.id else 0
+
+    # Первый вход второго пользователя — спросить пароль
+    if not is_authorized(uid):
+        if uid == MAIN_ADMIN:
+            pass
+        elif (m.text or "").strip() == ADMIN_PASSWORD and ADMIN_PASSWORD:
+            if uid not in USERS_STATE.get("authorized", []):
+                USERS_STATE.setdefault("authorized", []).append(uid)
+                save_users()
+            bot.reply_to(m, "✅ Добро пожаловать! Отправь /start")
+            return
+        else:
+            bot.reply_to(m, "🔐 Введи пароль для доступа:")
+            return
+
     st = state.get(m.chat.id)
     a = st.get("action") if isinstance(st, dict) else st
     if not a:
@@ -1466,7 +1529,9 @@ def handle_text(m):
         except Exception as e:
             bot.reply_to(m, "❌ " + esc(str(e)[:200]))
 
-# ============ PHOTO ============
+# ═══════════════════════════════════════════════════════════
+#   PHOTO
+# ═══════════════════════════════════════════════════════════
 @bot.message_handler(content_types=["photo"])
 def on_photo(m):
     if not adm(m):
@@ -1514,9 +1579,13 @@ def on_photo(m):
                 bot.send_message(m.chat.id, "⚠️ <b>Найдено:</b>\n" + esc(r[:500]))
         threading.Thread(target=_t, daemon=True).start()
 
-# ============ MAIN ============
+# ═══════════════════════════════════════════════════════════
+#   MAIN
+# ═══════════════════════════════════════════════════════════
 def main():
-    L.info("=== Playerok Bot v9.0 ===")
+    L.info("=== Playerok Bot v10.0 — instance: %s ===", INSTANCE_NAME)
+    L.info("Папка инстанса: %s", INST_DIR)
+
     if OK and cookie_str():
         try:
             connect()
@@ -1524,10 +1593,13 @@ def main():
             refresh_profile()
         except Exception as e:
             L.error("startup: %s", e)
+
     try:
-        notif("🚀 Bot v9.0 запущен\n🔗 " + (GITHUB_REPO if GITHUB_REPO else "GitHub не настроен"))
+        notif("🚀 <b>" + INSTANCE_NAME + "</b> запущен\n🔗 GitHub: " +
+              (GITHUB_REPO if GITHUB_REPO else "не настроен"))
     except Exception:
         pass
+
     L.info("telegram polling start")
     try:
         bot.infinity_polling(timeout=30, long_polling_timeout=30)
