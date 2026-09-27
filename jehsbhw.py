@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v11.4 — серверный поиск игр, загрузка всех через курсор."""
+"""KiriillBR Playerok Bot v11.6 — русские статусы, замечания модератора, поиск игр."""
 import json, logging, os, re, sys, threading, time, urllib.request, base64
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-BOT_VERSION = "11.4"
+BOT_VERSION = "11.6"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -175,6 +175,33 @@ _update_check = {"ts": 0, "has": False, "remote": ""}
 DRAFT = jload(DRAFT_FILE, {})
 
 def save_draft(): jsave(DRAFT_FILE, DRAFT)
+
+ITEM_STATUS_RU = {
+    "PENDING_APPROVAL": "⏳ На проверке",
+    "PENDING_MODERATION": "⏳ На модерации",
+    "APPROVED": "✅ Одобрено",
+    "DECLINED": "❌ Отклонено",
+    "BLOCKED": "🚫 Заблокировано",
+    "EXPIRED": "⏰ Истекло",
+    "SOLD": "💰 Продано",
+    "DRAFT": "📝 Черновик",
+}
+
+def item_status_ru(it):
+    st = g(it, "status", "state")
+    if st is None: return "—"
+    if hasattr(st, "name"): name = str(st.name)
+    elif hasattr(st, "value"): name = str(st.value)
+    else: name = str(st)
+    return ITEM_STATUS_RU.get(name.upper(), name)
+
+def item_status_desc(it):
+    return sv(g(it, "status_description"), "")
+
+def item_status_exp(it):
+    v = g(it, "status_expiration_date")
+    if not v: return ""
+    return str(v)[:19].replace("T", " ")
 
 def esc(s): return str(s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 def sv(v, d="—"):
@@ -717,12 +744,7 @@ def draft_start(cid):
     show_games(cid)
 
 def show_games(cid, force=False, page=0, query=None, load_all=False):
-    """Показывает игры.
-    - query: серверный поиск по названию
-    - load_all: грузит все игры через after_cursor (долго)
-    """
     total_known = cache.get("games_total", 0)
-
     if query:
         try:
             r = acc.get_games(name=query, count=24)
@@ -732,29 +754,22 @@ def show_games(cid, force=False, page=0, query=None, load_all=False):
             send(cid, "❌ Ошибка поиска: " + esc(str(e)[:200])); return
         kb = K(row_width=1)
         for gm in games:
-            gid = str(g(gm, "id", "slug", default=""))
+            gid = str(g(gm, "slug") or g(gm, "id") or "")
             nm = sv(g(gm, "name"), "?")
             kb.add(B("🎮 " + nm[:40], callback_data="cr_game:" + gid))
-        kb.row(B("🔍 Искать ещё", callback_data="cr_search"),
-               B("↩️ Все игры", callback_data="cr_games_all"))
+        kb.row(B("🔍 Искать ещё", callback_data="cr_search"), B("↩️ Все игры", callback_data="cr_games_all"))
         kb.add(B("❌ Отмена", callback_data="cr_cancel"))
         head = ("🔍 <b>Поиск: " + esc(query) + "</b>\n"
                 "🎮 Найдено: <b>" + str(total) + "</b> (показано " + str(len(games)) + ")\n\n")
-        if not games:
-            head += "❌ <i>Ничего не найдено</i>"
-        else:
-            head += "Выбери игру:"
+        if not games: head += "❌ <i>Ничего не найдено</i>"
+        else: head += "Выбери игру:"
         send(cid, head, kb)
         return
 
     games = list(cache.get("games", []))
-
-    # Если просят загрузить всё
     if load_all:
         send(cid, "⏳ Загружаю все игры (может занять 30-60 сек)...")
-        all_games = []
-        cur = None
-        tries = 0
+        all_games = []; cur = None; tries = 0
         while tries < 60:
             try:
                 r = acc.get_games(count=24, after_cursor=cur)
@@ -766,16 +781,12 @@ def show_games(cid, force=False, page=0, query=None, load_all=False):
                 cur = getattr(pi, "end_cursor", None) if pi else None
                 if not cur: break
                 tries += 1
-            except Exception as e:
-                L.warning("load all games err: %s", e); break
-        cache["games"] = all_games
-        cache["games_cursor"] = cur
-        cache["games_total"] = total_known
-        cache["games_ts"] = time.time()
+            except Exception as e: L.warning("load all games err: %s", e); break
+        cache["games"] = all_games; cache["games_cursor"] = cur
+        cache["games_total"] = total_known; cache["games_ts"] = time.time()
         games = all_games
         send(cid, "✅ Загружено: <b>" + str(len(games)) + "</b>")
 
-    # Если ничего не загружено — грузим первую страницу
     if not games:
         try:
             r = acc.get_games(count=24)
@@ -789,61 +800,75 @@ def show_games(cid, force=False, page=0, query=None, load_all=False):
         except Exception as e:
             send(cid, "❌ " + esc(str(e)[:200])); return
 
-    # Показываем по 8 на страницу
     per_page = 8
     total_loaded = len(games)
     slice_ = games[page*per_page:(page+1)*per_page]
-
     kb = K(row_width=1)
     for gm in slice_:
-        gid = str(g(gm, "id", "slug", default=""))
+        gid = str(g(gm, "slug") or g(gm, "id") or "")
         nm = sv(g(gm, "name"), "?")
         kb.add(B("🎮 " + nm[:40], callback_data="cr_game:" + gid))
-
     nav = []
     if page > 0: nav.append(B("⬅️", callback_data=f"cr_games_p:{page-1}"))
     if (page+1)*per_page < total_loaded: nav.append(B("➡️", callback_data=f"cr_games_p:{page+1}"))
     if nav: kb.row(*nav)
-
     if total_known and total_loaded < total_known:
         kb.row(B("📥 Загрузить все (" + str(total_known) + ")", callback_data="cr_games_loadall"))
-    kb.row(B("🔍 Поиск по названию", callback_data="cr_search"),
-           B("🔄 Сброс", callback_data="cr_games_r"))
+    kb.row(B("🔍 Поиск по названию", callback_data="cr_search"), B("🔄 Сброс", callback_data="cr_games_r"))
     kb.add(B("❌ Отмена", callback_data="cr_cancel"))
-
     pages_total = (total_loaded + per_page - 1) // per_page or 1
     head = ("➕ <b>Создание лота</b>\n\n"
             "🎮 Загружено: <b>" + str(total_loaded) + "</b> из <b>" + str(total_known) + "</b>\n"
             "📄 Стр. <b>" + str(page+1) + "/" + str(pages_total) + "</b>\n\n")
-    if not slice_:
-        head += "❌ <i>Пусто</i>"
-    else:
-        head += "Выбери игру:"
+    if not slice_: head += "❌ <i>Пусто</i>"
+    else: head += "Выбери игру:"
     send(cid, head, kb)
 
 def show_categories(cid, game_id):
-    send(cid, "⏳ Загружаю категории...")
+    L.info("show_categories: game_id=%r", game_id)
+    send(cid, "⏳ Загружаю категории для <code>" + esc(str(game_id)[:40]) + "</code>...")
+    gm = None; errs = []
     try:
-        try: gm = acc.get_game(slug=game_id)
-        except Exception: gm = acc.get_game(id=game_id)
+        gm = acc.get_game(slug=game_id)
+        L.info("get_game(slug=%s) OK", game_id)
     except Exception as e:
-        send(cid, "❌ " + esc(str(e)[:150])); return
+        errs.append("slug: " + str(e)[:100])
+        L.warning("get_game(slug=%s) fail: %s", game_id, str(e)[:150])
+    if gm is None:
+        try:
+            gm = acc.get_game(id=game_id)
+            L.info("get_game(id=%s) OK", game_id)
+        except Exception as e:
+            errs.append("id: " + str(e)[:100])
+    if gm is None:
+        try:
+            r = acc.get_games(name=game_id, count=24)
+            games = list(getattr(r, "games", []) or [])
+            for x in games:
+                if str(getattr(x, "slug", "")) == str(game_id) or str(getattr(x, "id", "")) == str(game_id):
+                    gm = acc.get_game(slug=getattr(x, "slug", None))
+                    break
+        except Exception as e: errs.append("search: " + str(e)[:100])
+    if gm is None:
+        send(cid, "❌ Не удалось загрузить игру\n\n<code>" + esc(" | ".join(errs)[:300]) + "</code>")
+        return
     cats = list(getattr(gm, "categories", []) or [])
     if not cats:
-        send(cid, "❌ Нет категорий"); return
+        send(cid, "❌ У игры нет категорий"); return
     kb = K(row_width=1)
     for c in cats:
         cid_ = str(g(c, "id", default=""))
         nm = sv(g(c, "name"), "?")
-        kb.add(B("📁 " + nm[:40], callback_data="cr_cat:" + game_id + "|" + cid_))
+        kb.add(B("📁 " + nm[:40], callback_data="cr_cat:" + str(game_id) + "|" + cid_))
     kb.row(B("🔍 Поиск по категориям", callback_data=f"cr_searchcat:{game_id}"))
     kb.add(B("◀️ Назад к играм", callback_data="cr_back_games"))
     kb.add(B("❌ Отмена", callback_data="cr_cancel"))
     DRAFT[str(cid)] = {"step": "category", "game_id": game_id, "game_slug": getattr(gm, "slug", game_id)}
     save_draft()
-    send(cid, "🎮 <b>" + esc(sv(g(gm, "name"), game_id)) + "</b>\n\nВыбери категорию:", kb)
+    send(cid, "🎮 <b>" + esc(sv(g(gm, "name"), game_id)) + "</b>\n\nВыбери категорию (" + str(len(cats)) + "):", kb)
 
 def show_obtaining(cid, game_id, cat_id):
+    L.info("show_obtaining: game=%r cat=%r", game_id, cat_id)
     try: cat = acc.get_game_category(cat_id)
     except Exception as e:
         send(cid, "❌ " + esc(str(e)[:150])); return
@@ -851,16 +876,10 @@ def show_obtaining(cid, game_id, cat_id):
         obts = list(getattr(acc.get_game_category_obtaining_types(cat_id), "obtaining_types", []) or [])
     except Exception:
         obts = []
-    DRAFT[str(cid)] = {
-        "step": "obtaining",
-        "game_id": game_id,
-        "cat_id": cat_id,
-        "cat_name": sv(g(cat, "name"), cat_id),
-    }
+    DRAFT[str(cid)] = {"step": "obtaining", "game_id": game_id, "cat_id": cat_id, "cat_name": sv(g(cat, "name"), cat_id)}
     save_draft()
     if not obts:
-        show_options(cid)
-        return
+        show_options(cid); return
     kb = K(row_width=1)
     for ob in obts:
         oid = str(g(ob, "id", default=""))
@@ -873,11 +892,9 @@ def show_obtaining(cid, game_id, cat_id):
 def show_options(cid):
     d = DRAFT.get(str(cid)) or {}
     cat_id = d.get("cat_id")
-    if not cat_id:
-        send(cid, "❌ Ошибка: нет категории"); return
+    if not cat_id: send(cid, "❌ Ошибка"); return
     try: cat = acc.get_game_category(cat_id)
-    except Exception as e:
-        send(cid, "❌ " + esc(str(e)[:150])); return
+    except Exception as e: send(cid, "❌ " + esc(str(e)[:150])); return
     opts = list(getattr(cat, "options", []) or [])
     fields = {}
     for o in opts:
@@ -891,10 +908,8 @@ def show_options(cid):
     d["options_selected"] = {}
     d["step"] = "options"
     save_draft()
-    if not fields:
-        show_data_fields(cid); return
-    first_field = list(fields.keys())[0]
-    show_options_field(cid, first_field)
+    if not fields: show_data_fields(cid); return
+    show_options_field(cid, list(fields.keys())[0])
 
 def show_options_field(cid, field):
     d = DRAFT.get(str(cid)) or {}
@@ -902,8 +917,7 @@ def show_options_field(cid, field):
     kb = K(row_width=2)
     for v in values[:40]:
         kb.add(B(v[:30], callback_data=f"cr_opt:{field}={v}"))
-    kb.row(B("⏭ Пропустить", callback_data=f"cr_opt_skip:{field}"),
-           B("❌ Отмена", callback_data="cr_cancel"))
+    kb.row(B("⏭ Пропустить", callback_data=f"cr_opt_skip:{field}"), B("❌ Отмена", callback_data="cr_cancel"))
     d["current_field"] = field
     save_draft()
     send(cid, f"⚙️ <b>Опция: {esc(field)}</b>\n\nВыбери значение (" + str(len(values)) + "):", kb)
@@ -913,8 +927,7 @@ def next_options_field(cid):
     fields = list(d.get("options_fields", {}).keys())
     selected = d.get("options_selected", {})
     for f in fields:
-        if f not in selected:
-            show_options_field(cid, f); return
+        if f not in selected: show_options_field(cid, f); return
     show_data_fields(cid)
 
 def show_data_fields(cid):
@@ -926,8 +939,7 @@ def show_data_fields(cid):
     try:
         df_res = acc.get_game_category_data_fields(cat_id, obt_id) if obt_id else None
         dfs = list(getattr(df_res, "data_fields", []) or []) if df_res else []
-    except Exception as e:
-        L.warning("get_data_fields: %s", e); dfs = []
+    except Exception as e: L.warning("get_data_fields: %s", e); dfs = []
     item_fields = []
     for f in dfs:
         t = getattr(f, "type", None)
@@ -962,15 +974,13 @@ def show_data_field(cid, idx):
     req = "⚠️ ОБЯЗАТЕЛЬНОЕ" if f["required"] else "(необязательное)"
     txt = (f"📋 <b>Поле {idx+1}/{len(lst)}: {esc(f['label'])}</b>\n{req}\n\nПришли значение:")
     kb = K(row_width=1)
-    if not f["required"]:
-        kb.add(B("⏭ Пропустить", callback_data="cr_df_skip"))
+    if not f["required"]: kb.add(B("⏭ Пропустить", callback_data="cr_df_skip"))
     kb.add(B("❌ Отмена", callback_data="cr_cancel"))
     send(cid, txt, kb)
 
 def next_data_field(cid):
     d = DRAFT.get(str(cid)) or {}
-    idx = d.get("current_df_idx", 0)
-    show_data_field(cid, idx + 1)
+    show_data_field(cid, d.get("current_df_idx", 0) + 1)
 
 def start_name_input(cid, name):
     d = DRAFT.get(str(cid)) or {}
@@ -1003,20 +1013,13 @@ def finalize_draft(cid, desc):
             df_payload = []
             for item in (d.get("data_fields_filled") or []):
                 df_payload.append({"id": item["id"], "value": item["value"]})
-            kw = {
-                "game_category_id": cat_id,
-                "name": d["name"],
-                "price": int(d["price"]),
-                "description": legal_wrap(d["description"]),
-                "options": selected_opts,
-                "data_fields": df_payload,
-                "attachments": [],
-            }
+            kw = {"game_category_id": cat_id, "name": d["name"], "price": int(d["price"]),
+                  "description": legal_wrap(d["description"]), "options": selected_opts,
+                  "data_fields": df_payload, "attachments": []}
             if d.get("obt_id"): kw["obtaining_type_id"] = d["obt_id"]
             try: it = acc.create_item(**kw)
             except TypeError:
-                kw.pop("obtaining_type_id", None)
-                it = acc.create_item(**kw)
+                kw.pop("obtaining_type_id", None); it = acc.create_item(**kw)
             iid = str(g(it, "id", default=""))
             L.info("created item: %s", iid)
             DRAFT.pop(str(cid), None); save_draft()
@@ -1031,8 +1034,7 @@ def finalize_draft(cid, desc):
                 if free:
                     acc.publish_item(iid, free.id)
                     send(cid, "📤 Опубликован (бесплатный статус)")
-                else:
-                    send(cid, "⚠️ Бесплатный статус не найден — публикуй вручную")
+                else: send(cid, "⚠️ Бесплатный статус не найден — публикуй вручную")
             except Exception as e:
                 L.warning("publish: %s", e)
                 send(cid, "⚠️ Публикация: " + esc(str(e)[:150]))
@@ -1229,16 +1231,14 @@ def cb(c):
         send(cid, "🔗 Тест...")
         threading.Thread(target=ai_ping_task, args=(cid,), daemon=True).start()
     # ─── МАСТЕР ───
-    elif a == "cr_start":
-        draft_start(cid)
+    elif a == "cr_start": draft_start(cid)
     elif a == "cr_cancel":
         DRAFT.pop(str(cid), None); save_draft()
         edit(cid, mid_, "❌ Отменено", K().add(B("◀️", callback_data="menu")))
     elif a == "cr_games_r":
         cache["games"] = []; cache["games_cursor"] = None
         show_games(cid, force=True)
-    elif a == "cr_games_all":
-        show_games(cid)
+    elif a == "cr_games_all": show_games(cid)
     elif a == "cr_games_loadall":
         threading.Thread(target=lambda: show_games(cid, load_all=True), daemon=True).start()
     elif a.startswith("cr_games_p:"):
@@ -1256,8 +1256,7 @@ def cb(c):
         gid = a[8:]; show_categories(cid, gid)
     elif a.startswith("cr_cat_back:"):
         game_id = a.split(":",1)[1]; show_categories(cid, game_id)
-    elif a == "cr_back_games":
-        show_games(cid)
+    elif a == "cr_back_games": show_games(cid)
     elif a.startswith("cr_cat:"):
         _, rest = a.split(":", 1)
         parts = rest.split("|", 1)
@@ -1290,6 +1289,25 @@ def cb(c):
         except Exception: off = 0
         show_items(cid, off)
     elif a.startswith("it:"): show_item(cid, a[3:])
+    elif a.startswith("chkstatus:"):
+        iid = a[10:]
+        send(cid, "🔄 Проверяю статус...")
+        def _chk():
+            try:
+                it = acc.get_item(iid)
+                st = g(it, "status")
+                st_ru = item_status_ru(it)
+                st_desc = item_status_desc(it)
+                st_exp = item_status_exp(it)
+                msg = "📊 <b>Статус: " + esc(st_ru) + "</b>"
+                if st_exp: msg += "\n📅 До: " + esc(st_exp)
+                if st_desc:
+                    msg += "\n\n⚠️ <b>Замечание:</b>\n<i>" + esc(st_desc[:800]) + "</i>"
+                kb = K(row_width=1).add(B("🔁 Открыть лот", callback_data="it:" + iid),
+                                        B("◀️ Назад", callback_data="items:0"))
+                send(cid, msg, kb)
+            except Exception as e: send(cid, "❌ " + esc(str(e)[:200]))
+        threading.Thread(target=_chk, daemon=True).start()
     elif a.startswith("edprice:"):
         state[cid] = {"action": "edprice", "id": a[8:]}; bot.send_message(cid, "💰 Цена:\n\n/cancel")
     elif a.startswith("edname:"):
@@ -1373,9 +1391,10 @@ def show_items(cid, off=0):
         name = sv(g(it, "name", "title"))
         try: price = int(g(it, "price", "amount") or 0)
         except Exception: price = 0
+        st_ru = item_status_ru(it)
         photos = item_photos(it)
         mark = "🖼" if photos else "·"
-        lines.append(mark + " <b>" + esc(name[:40]) + "</b> — " + str(price) + "₽")
+        lines.append(mark + " <b>" + esc(name[:40]) + "</b> — " + str(price) + "₽ · " + esc(st_ru))
         kb.add(B("📦 " + name[:20] + " · " + str(price) + "₽", callback_data="it:" + iid))
     kb.row(B("➕ Создать лот", callback_data="cr_start"), B("💰 Скидка", callback_data="disc"))
     kb.add(B("◀️", callback_data="menu"))
@@ -1393,27 +1412,36 @@ def show_item(cid, iid):
     desc = sv(g(it, "description"), "нет описания")
     try: price = int(g(it, "price", "amount") or 0)
     except Exception: price = 0
-    st = g(it, "status", "state")
-    st_s = str(getattr(st, "name", st) or "—")
+    st_ru = item_status_ru(it)
+    st_desc = item_status_desc(it)
+    st_exp = item_status_exp(it)
     photos = item_photos(it)
-    L.info("show_item %s photos=%d", iid[:12], len(photos))
+    L.info("show_item %s photos=%d status=%s", iid[:12], len(photos), st_ru)
     lines = ["📦 <b>" + esc(name) + "</b>", "",
              "💰 Цена: <b>" + str(price) + "₽</b>",
-             "📊 Статус: " + esc(st_s),
-             "🖼 Фото: <b>" + str(len(photos)) + "</b>",
-             "", "📝 " + esc(desc[:400])]
+             "📊 Статус: <b>" + esc(st_ru) + "</b>"]
+    if st_exp: lines.append("📅 До: " + esc(st_exp))
+    lines.append("🖼 Фото: <b>" + str(len(photos)) + "</b>")
+    if st_desc:
+        lines.append("")
+        lines.append("⚠️ <b>Замечание модератора:</b>")
+        lines.append("<i>" + esc(st_desc[:600]) + "</i>")
+    lines.append("")
+    lines.append("📝 " + esc(desc[:400]))
     kb = K(row_width=2)
     kb.row(B("💰 Цена", callback_data="edprice:" + iid), B("📝 Название", callback_data="edname:" + iid))
     kb.row(B("📄 Описание", callback_data="eddesc:" + iid), B("💸 Скидка", callback_data="disc1:" + iid))
     kb.row(B("📷 Сменить фото", callback_data="edphoto:" + iid), B("🌐 Открыть", url=item_url(iid, it)))
+    st_name = str(getattr(g(it, "status"), "name", "")).upper()
+    if st_name in ("DECLINED", "BLOCKED", "PENDING_MODERATION", "PENDING_APPROVAL"):
+        kb.row(B("🔄 Проверить статус", callback_data="chkstatus:" + iid))
     kb.add(B("◀️", callback_data="items:0"))
     txt = "\n".join(lines)
     if photos:
         for u in photos[:3]:
             try:
-                bot.send_photo(cid, u, caption=txt[:1024], reply_markup=kb, parse_mode="HTML")
-                L.info("send_photo OK: %s", u[:80]); return
-            except Exception as e: L.warning("send_photo fail %s: %s", u[:60], e)
+                bot.send_photo(cid, u, caption=txt[:1024], reply_markup=kb, parse_mode="HTML"); return
+            except Exception as e: L.warning("send_photo fail: %s", e)
     send(cid, txt, kb)
 
 def show_ai(cid):
@@ -1531,13 +1559,12 @@ def handle_text(m):
             bot.reply_to(m, "❌ " + esc(str(e)[:150])); return
         cats = list(getattr(gm, "categories", []) or [])
         found = [c for c in cats if q in str(g(c, "name", default="")).lower()]
-        if not found:
-            bot.reply_to(m, "❌ Не найдено"); return
+        if not found: bot.reply_to(m, "❌ Не найдено"); return
         kb = K(row_width=1)
         for c in found:
             cid_ = str(g(c, "id", default=""))
             nm = sv(g(c, "name"), "?")
-            kb.add(B("📁 " + nm[:40], callback_data="cr_cat:" + game_id + "|" + cid_))
+            kb.add(B("📁 " + nm[:40], callback_data="cr_cat:" + str(game_id) + "|" + cid_))
         kb.add(B("◀️ Назад", callback_data=f"cr_cat_back:{game_id}"))
         bot.reply_to(m, "🔍 Найдено: " + str(len(found)), reply_markup=kb)
     elif a == "reply":
@@ -1553,8 +1580,7 @@ def handle_text(m):
             try:
                 acc.send_message(chat_id=cid_chat, text=text)
                 bot.send_message(m.chat.id, "✅ Отправлено")
-            except Exception as e:
-                bot.send_message(m.chat.id, "❌ " + esc(str(e)[:200]))
+            except Exception as e: bot.send_message(m.chat.id, "❌ " + esc(str(e)[:200]))
         threading.Thread(target=_rc, daemon=True).start()
     elif a == "edprice":
         state.pop(m.chat.id, None); iid = st.get("id")
@@ -1650,12 +1676,10 @@ def main():
             threading.Thread(target=auto_update_worker, name="upd", daemon=True).start()
             refresh_profile()
         except Exception as e: L.error("startup: %s", e)
-    try:
-        notif("🚀 <b>" + INSTANCE_NAME + "</b> v" + BOT_VERSION)
+    try: notif("🚀 <b>" + INSTANCE_NAME + "</b> v" + BOT_VERSION)
     except Exception: pass
     L.info("telegram polling start")
-    try:
-        bot.infinity_polling(timeout=30, long_polling_timeout=30)
+    try: bot.infinity_polling(timeout=30, long_polling_timeout=30)
     except KeyboardInterrupt:
         stop.set(); save_seen()
 
