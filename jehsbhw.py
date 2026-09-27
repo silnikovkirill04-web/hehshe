@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v11.6 — русские статусы, замечания модератора, поиск игр."""
+"""KiriillBR Playerok Bot v11.7 — фикс застревания меню, AI-проверка везде."""
 import json, logging, os, re, sys, threading, time, urllib.request, base64
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-BOT_VERSION = "11.6"
+BOT_VERSION = "11.7"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -221,14 +221,31 @@ def is_authorized(uid):
 def adm(m):
     try: return is_authorized(int(m.chat.id))
     except Exception: return False
+
 def send(cid, text, kb=None):
     try: bot.send_message(cid, text, reply_markup=kb, disable_web_page_preview=True)
     except Exception as e: L.debug("send: %s", e)
+
 def notif(text, kb=None):
     if MAIN_ADMIN: send(MAIN_ADMIN, text, kb)
+
 def edit(cid, mid, text, kb=None):
-    try: bot.edit_message_text(text, cid, mid, reply_markup=kb)
-    except Exception as e: L.debug("edit: %s", e)
+    """Безопасное редактирование с fallback на send."""
+    try:
+        bot.edit_message_text(text, cid, mid, reply_markup=kb, disable_web_page_preview=True)
+        return True
+    except Exception as e:
+        emsg = str(e).lower()
+        # Если ничего не изменилось — не падаем
+        if "not modified" in emsg: return True
+        # Если сообщение слишком старое или не редактируется — шлём новое
+        try:
+            bot.send_message(cid, text, reply_markup=kb, disable_web_page_preview=True)
+            return False
+        except Exception as e2:
+            L.debug("edit+send fail: %s / %s", e, e2)
+            return False
+
 def cookies(): return (CREDS.get("cookies") or "").strip()
 def token_pk(): return (CREDS.get("token") or "").strip()
 def ddg5(): return (CREDS.get("ddg5") or "").strip()
@@ -516,6 +533,7 @@ def ai_check_image(data, mime="image/jpeg"):
         return True, ""
     except Exception as e:
         L.warning("AI img: %s", str(e)[:150]); return True, ""
+
 def ai_check_text(text):
     if not AI_CONFIG.get("enabled") or not text: return True, ""
     key = (AI_CONFIG.get("api_key") or "").strip()
@@ -535,6 +553,7 @@ def ai_check_text(text):
         return True, ""
     except Exception as e:
         L.warning("AI txt: %s", str(e)[:150]); return True, ""
+
 def guard_photo(data, mime="image/jpeg", label="фото"):
     if not AI_CONFIG.get("enabled"): return True, ""
     ok, reason = ai_check_image(data, mime)
@@ -542,6 +561,18 @@ def guard_photo(data, mime="image/jpeg", label="фото"):
     if AI_CONFIG.get("strict", True):
         return False, ("⚠️ <b>На " + label + " нарушения</b>\n\n<b>" + esc(reason[:400]) + "</b>\n\nЗамени фото.")
     notif("⚠️ <b>" + label + ":</b> " + esc(reason[:300]))
+    return True, ""
+
+def guard_text_ai(text, label="текст"):
+    """Комбо-проверка: regex + AI. Возвращает (ok, msg)."""
+    ok_v, hits = validate_text(text)
+    if not ok_v:
+        uniq = list(dict.fromkeys(hits))
+        return False, ("⚠️ <b>Заблокировано (regex)</b>\n\nВ " + label + ": <b>" + ", ".join(uniq) + "</b>\n\nПравила: playerok.com/terms-of-sale")
+    if AI_CONFIG.get("enabled"):
+        ok_ai, reason = ai_check_text(text)
+        if not ok_ai:
+            return False, ("⚠️ <b>Заблокировано (AI)</b>\n\nВ " + label + ":\n<i>" + esc(reason[:500]) + "</i>")
     return True, ""
 
 BANNED_PATTERNS = [
@@ -737,7 +768,7 @@ def auto_update_worker():
         except Exception as e: L.warning("auto_update: %s", e)
         if stop.wait(6 * 3600): return
 
-# ═══════════════════ МАСТЕР СОЗДАНИЯ ЛОТА ═══════════════════
+# ═══════════════════ МАСТЕР ═══════════════════
 def draft_start(cid):
     DRAFT[str(cid)] = {"step": "game"}
     save_draft()
@@ -765,10 +796,9 @@ def show_games(cid, force=False, page=0, query=None, load_all=False):
         else: head += "Выбери игру:"
         send(cid, head, kb)
         return
-
     games = list(cache.get("games", []))
     if load_all:
-        send(cid, "⏳ Загружаю все игры (может занять 30-60 сек)...")
+        send(cid, "⏳ Загружаю все игры...")
         all_games = []; cur = None; tries = 0
         while tries < 60:
             try:
@@ -786,7 +816,6 @@ def show_games(cid, force=False, page=0, query=None, load_all=False):
         cache["games_total"] = total_known; cache["games_ts"] = time.time()
         games = all_games
         send(cid, "✅ Загружено: <b>" + str(len(games)) + "</b>")
-
     if not games:
         try:
             r = acc.get_games(count=24)
@@ -799,7 +828,6 @@ def show_games(cid, force=False, page=0, query=None, load_all=False):
             total_known = cache["games_total"]
         except Exception as e:
             send(cid, "❌ " + esc(str(e)[:200])); return
-
     per_page = 8
     total_loaded = len(games)
     slice_ = games[page*per_page:(page+1)*per_page]
@@ -828,33 +856,24 @@ def show_categories(cid, game_id):
     L.info("show_categories: game_id=%r", game_id)
     send(cid, "⏳ Загружаю категории для <code>" + esc(str(game_id)[:40]) + "</code>...")
     gm = None; errs = []
-    try:
-        gm = acc.get_game(slug=game_id)
-        L.info("get_game(slug=%s) OK", game_id)
+    try: gm = acc.get_game(slug=game_id)
     except Exception as e:
-        errs.append("slug: " + str(e)[:100])
-        L.warning("get_game(slug=%s) fail: %s", game_id, str(e)[:150])
+        errs.append("slug: " + str(e)[:100]); L.warning("get_game(slug=%s) fail: %s", game_id, str(e)[:150])
     if gm is None:
-        try:
-            gm = acc.get_game(id=game_id)
-            L.info("get_game(id=%s) OK", game_id)
-        except Exception as e:
-            errs.append("id: " + str(e)[:100])
+        try: gm = acc.get_game(id=game_id)
+        except Exception as e: errs.append("id: " + str(e)[:100])
     if gm is None:
         try:
             r = acc.get_games(name=game_id, count=24)
             games = list(getattr(r, "games", []) or [])
             for x in games:
                 if str(getattr(x, "slug", "")) == str(game_id) or str(getattr(x, "id", "")) == str(game_id):
-                    gm = acc.get_game(slug=getattr(x, "slug", None))
-                    break
+                    gm = acc.get_game(slug=getattr(x, "slug", None)); break
         except Exception as e: errs.append("search: " + str(e)[:100])
     if gm is None:
-        send(cid, "❌ Не удалось загрузить игру\n\n<code>" + esc(" | ".join(errs)[:300]) + "</code>")
-        return
+        send(cid, "❌ Не удалось загрузить игру\n\n<code>" + esc(" | ".join(errs)[:300]) + "</code>"); return
     cats = list(getattr(gm, "categories", []) or [])
-    if not cats:
-        send(cid, "❌ У игры нет категорий"); return
+    if not cats: send(cid, "❌ У игры нет категорий"); return
     kb = K(row_width=1)
     for c in cats:
         cid_ = str(g(c, "id", default=""))
@@ -870,16 +889,12 @@ def show_categories(cid, game_id):
 def show_obtaining(cid, game_id, cat_id):
     L.info("show_obtaining: game=%r cat=%r", game_id, cat_id)
     try: cat = acc.get_game_category(cat_id)
-    except Exception as e:
-        send(cid, "❌ " + esc(str(e)[:150])); return
-    try:
-        obts = list(getattr(acc.get_game_category_obtaining_types(cat_id), "obtaining_types", []) or [])
-    except Exception:
-        obts = []
+    except Exception as e: send(cid, "❌ " + esc(str(e)[:150])); return
+    try: obts = list(getattr(acc.get_game_category_obtaining_types(cat_id), "obtaining_types", []) or [])
+    except Exception: obts = []
     DRAFT[str(cid)] = {"step": "obtaining", "game_id": game_id, "cat_id": cat_id, "cat_name": sv(g(cat, "name"), cat_id)}
     save_draft()
-    if not obts:
-        show_options(cid); return
+    if not obts: show_options(cid); return
     kb = K(row_width=1)
     for ob in obts:
         oid = str(g(ob, "id", default=""))
@@ -906,8 +921,7 @@ def show_options(cid):
         for x in v:
             d["options_map"][f"{k}={getattr(x, 'value', '')}"] = x
     d["options_selected"] = {}
-    d["step"] = "options"
-    save_draft()
+    d["step"] = "options"; save_draft()
     if not fields: show_data_fields(cid); return
     show_options_field(cid, list(fields.keys())[0])
 
@@ -918,8 +932,7 @@ def show_options_field(cid, field):
     for v in values[:40]:
         kb.add(B(v[:30], callback_data=f"cr_opt:{field}={v}"))
     kb.row(B("⏭ Пропустить", callback_data=f"cr_opt_skip:{field}"), B("❌ Отмена", callback_data="cr_cancel"))
-    d["current_field"] = field
-    save_draft()
+    d["current_field"] = field; save_draft()
     send(cid, f"⚙️ <b>Опция: {esc(field)}</b>\n\nВыбери значение (" + str(len(values)) + "):", kb)
 
 def next_options_field(cid):
@@ -948,8 +961,7 @@ def show_data_fields(cid):
     if not item_fields:
         d["data_fields_filled"] = []
         d["step"] = "name"; save_draft()
-        send(cid, "ℹ️ Обязательных полей данных нет.\n\n📝 Пришли <b>название</b> лота:\n\n/cancel — отмена")
-        return
+        send(cid, "ℹ️ Обязательных полей данных нет.\n\n📝 Пришли <b>название</b> лота:\n\n/cancel — отмена"); return
     d["data_fields_list"] = []
     for f in item_fields:
         d["data_fields_list"].append({
@@ -967,8 +979,7 @@ def show_data_field(cid, idx):
     lst = d.get("data_fields_list", [])
     if idx >= len(lst):
         d["step"] = "name"; save_draft()
-        send(cid, "✅ Данные заполнены.\n\n📝 Пришли <b>название</b> лота:\n\n/cancel — отмена")
-        return
+        send(cid, "✅ Данные заполнены.\n\n📝 Пришли <b>название</b> лота:\n\n/cancel — отмена"); return
     f = lst[idx]
     d["current_df_idx"] = idx; save_draft()
     req = "⚠️ ОБЯЗАТЕЛЬНОЕ" if f["required"] else "(необязательное)"
@@ -995,11 +1006,11 @@ def start_price_input(cid, price):
 def finalize_draft(cid, desc):
     d = DRAFT.get(str(cid)) or {}
     d["description"] = desc; save_draft()
-    ok_n, hits_n = validate_text(d.get("name", ""))
-    ok_d, hits_d = validate_text(desc)
+    # Проверка AI + regex
+    ok_n, msg_n = guard_text_ai(d.get("name", ""), "названии")
+    ok_d, msg_d = guard_text_ai(desc, "описании")
     if not ok_n or not ok_d:
-        hits = list(dict.fromkeys(hits_n + hits_d))
-        send(cid, "⚠️ <b>Заблокировано</b>\n\n" + ", ".join(hits) + "\n\nПопробуй /start и создай заново")
+        send(cid, (msg_n or msg_d) + "\n\nПопробуй /start и создай заново")
         DRAFT.pop(str(cid), None); save_draft(); return
     send(cid, "⏳ Создаю лот...")
     def _create():
@@ -1036,8 +1047,7 @@ def finalize_draft(cid, desc):
                     send(cid, "📤 Опубликован (бесплатный статус)")
                 else: send(cid, "⚠️ Бесплатный статус не найден — публикуй вручную")
             except Exception as e:
-                L.warning("publish: %s", e)
-                send(cid, "⚠️ Публикация: " + esc(str(e)[:150]))
+                L.warning("publish: %s", e); send(cid, "⚠️ Публикация: " + esc(str(e)[:150]))
             try: show_item(cid, iid)
             except Exception: pass
         except Exception as e:
@@ -1109,218 +1119,218 @@ def cmd_cancel(m):
 
 @bot.callback_query_handler(func=lambda c: True)
 def cb(c):
-    if not is_authorized(int(c.from_user.id)):
-        try: bot.answer_callback_query(c.id, "⛔")
-        except Exception: pass
-        return
+    # СРАЗУ отвечаем на callback чтобы кнопки не висали
     try: bot.answer_callback_query(c.id)
     except Exception: pass
+    if not is_authorized(int(c.from_user.id)):
+        return
     a = c.data; cid = c.message.chat.id; mid_ = c.message.id
-    L.info("CB: %r", a)
-
-    if a in ("menu","status","refresh"):
-        edit(cid, mid_, main_text(), main_kb())
-    elif a == "conn":
-        lines = ["🔌 <b>Подключение</b>", "",
-                 "🍪 cookies: <b>" + str(len(cookies())) + "</b>",
-                 "🎫 token: <b>" + str(len(token_pk())) + "</b>",
-                 "🛡 ddg5: <b>" + str(len(ddg5())) + "</b>",
-                 "🌐 прокси: " + ("✅ " + PROXY if PROXY else "❌ нет"), ""]
-        lines.append("✅ " + esc(sv(g(acc, "username"))) if acc else "❌ Не подключён")
-        kb = K(row_width=1)
-        kb.add(B("🍪 Cookies", callback_data="in_cookies"))
-        kb.add(B("🎫 Token", callback_data="in_token"))
-        kb.add(B("🛡 ddg5", callback_data="in_ddg5"))
-        kb.add(B("🔄 Реконнект", callback_data="reconn"))
-        kb.add(B("◀️", callback_data="menu"))
-        edit(cid, mid_, "\n".join(lines), kb)
-    elif a == "in_cookies":
-        state[cid] = {"action": "cookies"}; bot.send_message(cid, "🍪 Cookie:\n\n/cancel")
-    elif a == "in_token":
-        state[cid] = {"action": "token"}; bot.send_message(cid, "🎫 JWT:\n\n/cancel")
-    elif a == "in_ddg5":
-        state[cid] = {"action": "ddg5"}; bot.send_message(cid, "🛡 __ddg5_:\n\n/cancel")
-    elif a == "reconn":
-        def _r():
-            global acc
-            acc = None
-            try:
-                connect(); refresh_profile()
-                notif("🟢 " + INSTANCE_NAME + " переподключён")
-            except Exception as e: notif("❌ " + esc(str(e)[:200]))
-        threading.Thread(target=_r, daemon=True).start()
-    elif a in ("chats","chats_load"): show_chats(cid, True)
-    elif a.startswith("c:"): show_history(cid, a[2:])
-    elif a.startswith("r:"):
-        state[cid] = {"action": "reply", "chat": a[2:]}; bot.send_message(cid, "✍️ Текст:\n\n/cancel")
-    elif a == "deals": show_deals(cid)
-    elif a == "notify": show_notify(cid)
-    elif a.startswith("tog:"):
-        k = a[4:]
-        if k in SET_D: SET_D[k] = not SET_D[k]; save_set()
-        if k in ("notify_messages","notify_deals","auto_confirm"): show_notify(cid)
-        elif k == "auto_bump": show_bump(cid)
-        elif k == "auto_update": show_set(cid)
-    elif a == "bump": show_bump(cid)
-    elif a.startswith("cyc:"):
-        k = a[4:]
-        cyc = {"auto_bump_min": [60,120,240,480,720], "auto_bump_max": [10,50,100,500,1000], "auto_confirm_delay": [10,30,60,120,300]}
-        if k in cyc:
-            try: cur = int(SET_D.get(k, cyc[k][0]))
-            except Exception: cur = cyc[k][0]
-            nxt = cyc[k][(cyc[k].index(cur)+1)%len(cyc[k])] if cur in cyc[k] else cyc[k][0]
-            SET_D[k] = nxt; save_set()
-        show_bump(cid)
-    elif a == "prof":
-        if acc is None: send(cid, "❌"); return
-        refresh_profile(); d = profile or {}
-        txt = ("👤 <b>Профиль</b>\n\n🆔 <code>" + esc(d.get("id","—")) + "</code>\n👤 <b>" + esc(d.get("username","—")) + "</b>")
-        send(cid, txt, K().add(B("◀️", callback_data="menu")))
-    elif a == "set":
-        auto = "✅ вкл" if SET_D.get("auto_update", True) else "❌ выкл"
-        upd = "—"
-        if _update_check.get("ts"):
-            upd = ("🔄 " + _update_check.get("remote","") + " доступна") if _update_check.get("has") else "✅ актуально"
-        lines = ["⚙️ <b>Настройки</b>", "",
-                 "🆔 Инстанс: <b>" + esc(INSTANCE_NAME) + "</b>",
-                 "📦 Версия: <b>" + esc(BOT_VERSION) + "</b>",
-                 "🔄 Автообновление: <b>" + auto + "</b>",
-                 "📊 " + upd]
-        kb = K(row_width=1)
-        kb.add(B("🔍 Проверить обновления", callback_data="check_upd"))
-        kb.add(B("🔄 Автообновление " + auto, callback_data="tog:auto_update"))
-        kb.add(B("🛠 Обновить сейчас", callback_data="update"))
-        kb.add(B("🔄 Перезапустить", callback_data="restart"))
-        kb.add(B("📄 Лог", callback_data="log"))
-        kb.add(B("◀️", callback_data="menu"))
-        edit(cid, mid_, "\n".join(lines), kb)
-    elif a == "check_upd":
-        send(cid, "🔍 Проверяю...")
-        def _cu():
-            has, remote, err = check_updates(silent=True)
-            if err: send(cid, "❌ " + esc(err))
-            elif has:
-                kb = K(row_width=2)
-                kb.row(B("🔧 Обновить", callback_data="update"), B("◀️", callback_data="set"))
-                send(cid, "🔄 Доступно: <b>" + esc(remote) + "</b>\nТекущая: <b>" + esc(BOT_VERSION) + "</b>", kb)
-            else: send(cid, "✅ Актуальная: <b>" + esc(BOT_VERSION) + "</b>")
-        threading.Thread(target=_cu, daemon=True).start()
-    elif a == "update":
-        send(cid, "📥 Скачиваю обновление с GitHub...")
-        threading.Thread(target=do_update, args=(cid,), daemon=True).start()
-    elif a == "restart":
-        send(cid, "🔄"); time.sleep(1); os.execv(sys.executable, [sys.executable] + sys.argv)
-    elif a == "log": cmd_log(c)
-    elif a == "ai": show_ai(cid)
-    elif a == "ai_tog":
-        AI_CONFIG["enabled"] = not AI_CONFIG.get("enabled", False); save_ai(); show_ai(cid)
-    elif a == "ai_prov": show_ai_prov(cid)
-    elif a.startswith("ai_setp:"):
-        AI_CONFIG["provider"] = a.split(":",1)[1]; save_ai(); show_ai(cid)
-    elif a == "ai_key":
-        state[cid] = {"action": "ai_key"}; bot.send_message(cid, "🔑 Ключ:\n\n/cancel")
-    elif a == "ai_model":
-        state[cid] = {"action": "ai_model"}; bot.send_message(cid, "📝 Модель:\n\n/cancel")
-    elif a == "ai_mode":
-        AI_CONFIG["strict"] = not AI_CONFIG.get("strict", True); save_ai(); show_ai(cid)
-    elif a == "ai_clear":
-        AI_CONFIG["api_key"] = ""; AI_CONFIG["enabled"] = False; save_ai(); show_ai(cid)
-    elif a == "ai_test":
-        state[cid] = {"action": "ai_test"}; bot.send_message(cid, "🧪 Фото или текст:\n\n/cancel")
-    elif a == "ai_ping":
-        send(cid, "🔗 Тест...")
-        threading.Thread(target=ai_ping_task, args=(cid,), daemon=True).start()
-    # ─── МАСТЕР ───
-    elif a == "cr_start": draft_start(cid)
-    elif a == "cr_cancel":
-        DRAFT.pop(str(cid), None); save_draft()
-        edit(cid, mid_, "❌ Отменено", K().add(B("◀️", callback_data="menu")))
-    elif a == "cr_games_r":
-        cache["games"] = []; cache["games_cursor"] = None
-        show_games(cid, force=True)
-    elif a == "cr_games_all": show_games(cid)
-    elif a == "cr_games_loadall":
-        threading.Thread(target=lambda: show_games(cid, load_all=True), daemon=True).start()
-    elif a.startswith("cr_games_p:"):
-        try: p = int(a.split(":")[1])
-        except Exception: p = 0
-        show_games(cid, page=p)
-    elif a == "cr_search":
-        state[cid] = {"action": "cr_search"}
-        bot.send_message(cid, "🔍 Пришли название игры:\n\n/cancel — отмена")
-    elif a.startswith("cr_searchcat:"):
-        game_id = a.split(":",1)[1]
-        state[cid] = {"action": "cr_searchcat", "game_id": game_id}
-        bot.send_message(cid, "🔍 Пришли название категории:\n\n/cancel — отмена")
-    elif a.startswith("cr_game:"):
-        gid = a[8:]; show_categories(cid, gid)
-    elif a.startswith("cr_cat_back:"):
-        game_id = a.split(":",1)[1]; show_categories(cid, game_id)
-    elif a == "cr_back_games": show_games(cid)
-    elif a.startswith("cr_cat:"):
-        _, rest = a.split(":", 1)
-        parts = rest.split("|", 1)
-        if len(parts) == 2: show_obtaining(cid, parts[0], parts[1])
-    elif a.startswith("cr_obt:"):
-        oid = a[7:]
-        d = DRAFT.get(str(cid)) or {}
-        d["obt_id"] = oid; save_draft()
-        show_options(cid)
-    elif a.startswith("cr_opt_skip:"):
-        d = DRAFT.get(str(cid)) or {}
-        d.setdefault("options_selected", {}); save_draft()
-        next_options_field(cid)
-    elif a.startswith("cr_opt:"):
-        rest = a[7:]
-        if "=" in rest:
-            field, val = rest.split("=", 1)
+    try:
+        L.info("CB: %r", a)
+        if a in ("menu","status","refresh"):
+            edit(cid, mid_, main_text(), main_kb())
+        elif a == "conn":
+            lines = ["🔌 <b>Подключение</b>", "",
+                     "🍪 cookies: <b>" + str(len(cookies())) + "</b>",
+                     "🎫 token: <b>" + str(len(token_pk())) + "</b>",
+                     "🛡 ddg5: <b>" + str(len(ddg5())) + "</b>",
+                     "🌐 прокси: " + ("✅ " + PROXY if PROXY else "❌ нет"), ""]
+            lines.append("✅ " + esc(sv(g(acc, "username"))) if acc else "❌ Не подключён")
+            kb = K(row_width=1)
+            kb.add(B("🍪 Cookies", callback_data="in_cookies"))
+            kb.add(B("🎫 Token", callback_data="in_token"))
+            kb.add(B("🛡 ddg5", callback_data="in_ddg5"))
+            kb.add(B("🔄 Реконнект", callback_data="reconn"))
+            kb.add(B("◀️", callback_data="menu"))
+            edit(cid, mid_, "\n".join(lines), kb)
+        elif a == "in_cookies":
+            state[cid] = {"action": "cookies"}; bot.send_message(cid, "🍪 Cookie:\n\n/cancel")
+        elif a == "in_token":
+            state[cid] = {"action": "token"}; bot.send_message(cid, "🎫 JWT:\n\n/cancel")
+        elif a == "in_ddg5":
+            state[cid] = {"action": "ddg5"}; bot.send_message(cid, "🛡 __ddg5_:\n\n/cancel")
+        elif a == "reconn":
+            def _r():
+                global acc
+                acc = None
+                try:
+                    connect(); refresh_profile()
+                    notif("🟢 " + INSTANCE_NAME + " переподключён")
+                except Exception as e: notif("❌ " + esc(str(e)[:200]))
+            threading.Thread(target=_r, daemon=True).start()
+        elif a in ("chats","chats_load"): show_chats(cid, True)
+        elif a.startswith("c:"): show_history(cid, a[2:])
+        elif a.startswith("r:"):
+            state[cid] = {"action": "reply", "chat": a[2:]}; bot.send_message(cid, "✍️ Текст:\n\n/cancel")
+        elif a == "deals": show_deals(cid)
+        elif a == "notify": show_notify(cid)
+        elif a.startswith("tog:"):
+            k = a[4:]
+            if k in SET_D: SET_D[k] = not SET_D[k]; save_set()
+            if k in ("notify_messages","notify_deals","auto_confirm"): show_notify(cid)
+            elif k == "auto_bump": show_bump(cid)
+            elif k == "auto_update": show_set(cid)
+        elif a == "bump": show_bump(cid)
+        elif a.startswith("cyc:"):
+            k = a[4:]
+            cyc = {"auto_bump_min": [60,120,240,480,720], "auto_bump_max": [10,50,100,500,1000], "auto_confirm_delay": [10,30,60,120,300]}
+            if k in cyc:
+                try: cur = int(SET_D.get(k, cyc[k][0]))
+                except Exception: cur = cyc[k][0]
+                nxt = cyc[k][(cyc[k].index(cur)+1)%len(cyc[k])] if cur in cyc[k] else cyc[k][0]
+                SET_D[k] = nxt; save_set()
+            show_bump(cid)
+        elif a == "prof":
+            if acc is None: send(cid, "❌"); return
+            refresh_profile(); d = profile or {}
+            txt = ("👤 <b>Профиль</b>\n\n🆔 <code>" + esc(d.get("id","—")) + "</code>\n👤 <b>" + esc(d.get("username","—")) + "</b>")
+            send(cid, txt, K().add(B("◀️", callback_data="menu")))
+        elif a == "set":
+            auto = "✅ вкл" if SET_D.get("auto_update", True) else "❌ выкл"
+            upd = "—"
+            if _update_check.get("ts"):
+                upd = ("🔄 " + _update_check.get("remote","") + " доступна") if _update_check.get("has") else "✅ актуально"
+            lines = ["⚙️ <b>Настройки</b>", "",
+                     "🆔 Инстанс: <b>" + esc(INSTANCE_NAME) + "</b>",
+                     "📦 Версия: <b>" + esc(BOT_VERSION) + "</b>",
+                     "🔄 Автообновление: <b>" + auto + "</b>",
+                     "📊 " + upd]
+            kb = K(row_width=1)
+            kb.add(B("🔍 Проверить обновления", callback_data="check_upd"))
+            kb.add(B("🔄 Автообновление " + auto, callback_data="tog:auto_update"))
+            kb.add(B("🛠 Обновить сейчас", callback_data="update"))
+            kb.add(B("🔄 Перезапустить", callback_data="restart"))
+            kb.add(B("📄 Лог", callback_data="log"))
+            kb.add(B("◀️", callback_data="menu"))
+            edit(cid, mid_, "\n".join(lines), kb)
+        elif a == "check_upd":
+            send(cid, "🔍 Проверяю...")
+            def _cu():
+                has, remote, err = check_updates(silent=True)
+                if err: send(cid, "❌ " + esc(err))
+                elif has:
+                    kb = K(row_width=2)
+                    kb.row(B("🔧 Обновить", callback_data="update"), B("◀️", callback_data="set"))
+                    send(cid, "🔄 Доступно: <b>" + esc(remote) + "</b>\nТекущая: <b>" + esc(BOT_VERSION) + "</b>", kb)
+                else: send(cid, "✅ Актуальная: <b>" + esc(BOT_VERSION) + "</b>")
+            threading.Thread(target=_cu, daemon=True).start()
+        elif a == "update":
+            send(cid, "📥 Скачиваю обновление с GitHub...")
+            threading.Thread(target=do_update, args=(cid,), daemon=True).start()
+        elif a == "restart":
+            send(cid, "🔄"); time.sleep(1); os.execv(sys.executable, [sys.executable] + sys.argv)
+        elif a == "log": cmd_log(c)
+        elif a == "ai": show_ai(cid)
+        elif a == "ai_tog":
+            AI_CONFIG["enabled"] = not AI_CONFIG.get("enabled", False); save_ai(); show_ai(cid)
+        elif a == "ai_prov": show_ai_prov(cid)
+        elif a.startswith("ai_setp:"):
+            AI_CONFIG["provider"] = a.split(":",1)[1]; save_ai(); show_ai(cid)
+        elif a == "ai_key":
+            state[cid] = {"action": "ai_key"}; bot.send_message(cid, "🔑 Ключ:\n\n/cancel")
+        elif a == "ai_model":
+            state[cid] = {"action": "ai_model"}; bot.send_message(cid, "📝 Модель:\n\n/cancel")
+        elif a == "ai_mode":
+            AI_CONFIG["strict"] = not AI_CONFIG.get("strict", True); save_ai(); show_ai(cid)
+        elif a == "ai_clear":
+            AI_CONFIG["api_key"] = ""; AI_CONFIG["enabled"] = False; save_ai(); show_ai(cid)
+        elif a == "ai_test":
+            state[cid] = {"action": "ai_test"}; bot.send_message(cid, "🧪 Фото или текст:\n\n/cancel")
+        elif a == "ai_ping":
+            send(cid, "🔗 Тест...")
+            threading.Thread(target=ai_ping_task, args=(cid,), daemon=True).start()
+        # МАСТЕР
+        elif a == "cr_start": draft_start(cid)
+        elif a == "cr_cancel":
+            DRAFT.pop(str(cid), None); save_draft()
+            edit(cid, mid_, "❌ Отменено", K().add(B("◀️", callback_data="menu")))
+        elif a == "cr_games_r":
+            cache["games"] = []; cache["games_cursor"] = None
+            show_games(cid, force=True)
+        elif a == "cr_games_all": show_games(cid)
+        elif a == "cr_games_loadall":
+            threading.Thread(target=lambda: show_games(cid, load_all=True), daemon=True).start()
+        elif a.startswith("cr_games_p:"):
+            try: p = int(a.split(":")[1])
+            except Exception: p = 0
+            show_games(cid, page=p)
+        elif a == "cr_search":
+            state[cid] = {"action": "cr_search"}
+            bot.send_message(cid, "🔍 Пришли название игры:\n\n/cancel — отмена")
+        elif a.startswith("cr_searchcat:"):
+            game_id = a.split(":",1)[1]
+            state[cid] = {"action": "cr_searchcat", "game_id": game_id}
+            bot.send_message(cid, "🔍 Пришли название категории:\n\n/cancel — отмена")
+        elif a.startswith("cr_game:"):
+            gid = a[8:]; show_categories(cid, gid)
+        elif a.startswith("cr_cat_back:"):
+            game_id = a.split(":",1)[1]; show_categories(cid, game_id)
+        elif a == "cr_back_games": show_games(cid)
+        elif a.startswith("cr_cat:"):
+            _, rest = a.split(":", 1)
+            parts = rest.split("|", 1)
+            if len(parts) == 2: show_obtaining(cid, parts[0], parts[1])
+        elif a.startswith("cr_obt:"):
+            oid = a[7:]
             d = DRAFT.get(str(cid)) or {}
-            d.setdefault("options_selected", {})[field] = val
-            save_draft(); next_options_field(cid)
-    elif a == "cr_df_skip":
-        d = DRAFT.get(str(cid)) or {}
-        idx = d.get("current_df_idx", 0)
-        lst = d.get("data_fields_list", [])
-        if idx < len(lst): lst[idx]["value"] = None
-        save_draft(); next_data_field(cid)
-    # ─── ЛОТЫ ───
-    elif a == "items" or a.startswith("items:"):
-        try: off = int(a.split(":")[1]) if ":" in a else 0
-        except Exception: off = 0
-        show_items(cid, off)
-    elif a.startswith("it:"): show_item(cid, a[3:])
-    elif a.startswith("chkstatus:"):
-        iid = a[10:]
-        send(cid, "🔄 Проверяю статус...")
-        def _chk():
-            try:
-                it = acc.get_item(iid)
-                st = g(it, "status")
-                st_ru = item_status_ru(it)
-                st_desc = item_status_desc(it)
-                st_exp = item_status_exp(it)
-                msg = "📊 <b>Статус: " + esc(st_ru) + "</b>"
-                if st_exp: msg += "\n📅 До: " + esc(st_exp)
-                if st_desc:
-                    msg += "\n\n⚠️ <b>Замечание:</b>\n<i>" + esc(st_desc[:800]) + "</i>"
-                kb = K(row_width=1).add(B("🔁 Открыть лот", callback_data="it:" + iid),
-                                        B("◀️ Назад", callback_data="items:0"))
-                send(cid, msg, kb)
-            except Exception as e: send(cid, "❌ " + esc(str(e)[:200]))
-        threading.Thread(target=_chk, daemon=True).start()
-    elif a.startswith("edprice:"):
-        state[cid] = {"action": "edprice", "id": a[8:]}; bot.send_message(cid, "💰 Цена:\n\n/cancel")
-    elif a.startswith("edname:"):
-        state[cid] = {"action": "edname", "id": a[7:]}; bot.send_message(cid, "📝 Название:\n\n/cancel")
-    elif a.startswith("eddesc:"):
-        state[cid] = {"action": "eddesc", "id": a[7:]}; bot.send_message(cid, "📄 Описание:\n\n/cancel")
-    elif a.startswith("edphoto:"):
-        state[cid] = {"action": "edphoto", "id": a[8:]}; bot.send_message(cid, "📷 Фото:\n\n/cancel")
-    elif a.startswith("disc1:"):
-        state[cid] = {"action": "disc1", "id": a[6:]}; bot.send_message(cid, "💸 %:\n\n/cancel")
-    elif a == "disc":
-        state[cid] = {"action": "disc"}; bot.send_message(cid, "💰 % на все:\n\n/cancel")
-    else: L.warning("CB unhandled: %r", a)
+            d["obt_id"] = oid; save_draft()
+            show_options(cid)
+        elif a.startswith("cr_opt_skip:"):
+            d = DRAFT.get(str(cid)) or {}
+            d.setdefault("options_selected", {}); save_draft()
+            next_options_field(cid)
+        elif a.startswith("cr_opt:"):
+            rest = a[7:]
+            if "=" in rest:
+                field, val = rest.split("=", 1)
+                d = DRAFT.get(str(cid)) or {}
+                d.setdefault("options_selected", {})[field] = val
+                save_draft(); next_options_field(cid)
+        elif a == "cr_df_skip":
+            d = DRAFT.get(str(cid)) or {}
+            idx = d.get("current_df_idx", 0)
+            lst = d.get("data_fields_list", [])
+            if idx < len(lst): lst[idx]["value"] = None
+            save_draft(); next_data_field(cid)
+        # ЛОТЫ
+        elif a == "items" or a.startswith("items:"):
+            try: off = int(a.split(":")[1]) if ":" in a else 0
+            except Exception: off = 0
+            show_items(cid, off)
+        elif a.startswith("it:"): show_item(cid, a[3:])
+        elif a.startswith("chkstatus:"):
+            iid = a[10:]
+            send(cid, "🔄 Проверяю статус...")
+            def _chk():
+                try:
+                    it = acc.get_item(iid)
+                    st_ru = item_status_ru(it)
+                    st_desc = item_status_desc(it)
+                    st_exp = item_status_exp(it)
+                    msg = "📊 <b>Статус: " + esc(st_ru) + "</b>"
+                    if st_exp: msg += "\n📅 До: " + esc(st_exp)
+                    if st_desc: msg += "\n\n⚠️ <b>Замечание:</b>\n<i>" + esc(st_desc[:800]) + "</i>"
+                    kb = K(row_width=1).add(B("🔁 Открыть лот", callback_data="it:" + iid), B("◀️ Назад", callback_data="items:0"))
+                    send(cid, msg, kb)
+                except Exception as e: send(cid, "❌ " + esc(str(e)[:200]))
+            threading.Thread(target=_chk, daemon=True).start()
+        elif a.startswith("edprice:"):
+            state[cid] = {"action": "edprice", "id": a[8:]}; bot.send_message(cid, "💰 Цена:\n\n/cancel")
+        elif a.startswith("edname:"):
+            state[cid] = {"action": "edname", "id": a[7:]}; bot.send_message(cid, "📝 Название:\n\n/cancel")
+        elif a.startswith("eddesc:"):
+            state[cid] = {"action": "eddesc", "id": a[7:]}; bot.send_message(cid, "📄 Описание:\n\n/cancel")
+        elif a.startswith("edphoto:"):
+            state[cid] = {"action": "edphoto", "id": a[8:]}; bot.send_message(cid, "📷 Фото:\n\n/cancel")
+        elif a.startswith("disc1:"):
+            state[cid] = {"action": "disc1", "id": a[6:]}; bot.send_message(cid, "💸 %:\n\n/cancel")
+        elif a == "disc":
+            state[cid] = {"action": "disc"}; bot.send_message(cid, "💰 % на все:\n\n/cancel")
+        else: L.warning("CB unhandled: %r", a)
+    except Exception as e:
+        L.exception("cb error: %s", e)
+        try: bot.send_message(cid, "❌ Ошибка: " + esc(str(e)[:200]))
+        except Exception: pass
 
 def show_chats(cid, refresh=False):
     global cache
@@ -1423,11 +1433,9 @@ def show_item(cid, iid):
     if st_exp: lines.append("📅 До: " + esc(st_exp))
     lines.append("🖼 Фото: <b>" + str(len(photos)) + "</b>")
     if st_desc:
-        lines.append("")
-        lines.append("⚠️ <b>Замечание модератора:</b>")
+        lines.append(""); lines.append("⚠️ <b>Замечание модератора:</b>")
         lines.append("<i>" + esc(st_desc[:600]) + "</i>")
-    lines.append("")
-    lines.append("📝 " + esc(desc[:400]))
+    lines.append(""); lines.append("📝 " + esc(desc[:400]))
     kb = K(row_width=2)
     kb.row(B("💰 Цена", callback_data="edprice:" + iid), B("📝 Название", callback_data="edname:" + iid))
     kb.row(B("📄 Описание", callback_data="eddesc:" + iid), B("💸 Скидка", callback_data="disc1:" + iid))
@@ -1452,7 +1460,13 @@ def show_ai(cid):
              "Режим: <b>" + ("🔒 блокировать" if c.get("strict") else "🟡 предупреждать") + "</b>",
              "Провайдер: <code>" + esc(c.get("provider") or "—") + "</code>",
              "Модель: <code>" + esc(c.get("model") or "(по умолчанию)") + "</code>",
-             "Ключ: " + ("✅" if has_key else "❌")]
+             "Ключ: " + ("✅" if has_key else "❌"),
+             "",
+             "Проверка работает везде:",
+             "• Названия/описания лотов",
+             "• Сообщения покупателям",
+             "• Фото лотов",
+             "• Создание новых лотов"]
     kb = K(row_width=2)
     kb.row(B("🔴 Выкл" if on else "🟢 Вкл", callback_data="ai_tog"), B("🔒 Строго" if not c.get("strict") else "🟡 Мягко", callback_data="ai_mode"))
     kb.row(B("🔑 Ключ", callback_data="ai_key"), B("🎯 Провайдер", callback_data="ai_prov"))
@@ -1512,7 +1526,7 @@ def handle_text(m):
                 d["data_fields_filled"].append({"id": lst[idx]["id"], "value": text})
             save_draft(); next_data_field(m.chat.id); return
         if step == "name":
-            okv, msg = guard_text(text, "названии")
+            okv, msg = guard_text_ai(text, "названии")
             if not okv: bot.reply_to(m, msg); return
             start_name_input(m.chat.id, text); return
         if step == "price":
@@ -1550,8 +1564,7 @@ def handle_text(m):
         show_games(m.chat.id, query=(m.text or "").strip())
     elif a == "cr_searchcat":
         state.pop(m.chat.id, None)
-        game_id = st.get("game_id")
-        q = (m.text or "").strip().lower()
+        game_id = st.get("game_id"); q = (m.text or "").strip().lower()
         try:
             try: gm = acc.get_game(slug=game_id)
             except Exception: gm = acc.get_game(id=game_id)
@@ -1593,22 +1606,30 @@ def handle_text(m):
         except Exception as e: bot.reply_to(m, "❌ " + esc(str(e)[:200]))
     elif a == "edname":
         state.pop(m.chat.id, None); iid = st.get("id"); v = (m.text or "").strip()
-        okv, msg = guard_text(v, "названии")
-        if not okv: bot.reply_to(m, msg); return
-        try:
-            it = acc.get_item(iid)
-            acc.update_item(iid, name=v, price=int(it.price), description=getattr(it,"description","") or "", options=getattr(it,"options",None) or [], data_fields=getattr(it,"data_fields",None) or [])
-            bot.reply_to(m, "✅"); show_item(m.chat.id, iid)
-        except Exception as e: bot.reply_to(m, "❌ " + esc(str(e)[:200]))
+        bot.reply_to(m, "🔍 Проверяю...")
+        def _en():
+            okv, msg = guard_text_ai(v, "названии")
+            if not okv:
+                bot.send_message(m.chat.id, msg); return
+            try:
+                it = acc.get_item(iid)
+                acc.update_item(iid, name=v, price=int(it.price), description=getattr(it,"description","") or "", options=getattr(it,"options",None) or [], data_fields=getattr(it,"data_fields",None) or [])
+                bot.send_message(m.chat.id, "✅"); show_item(m.chat.id, iid)
+            except Exception as e: bot.send_message(m.chat.id, "❌ " + esc(str(e)[:200]))
+        threading.Thread(target=_en, daemon=True).start()
     elif a == "eddesc":
         state.pop(m.chat.id, None); iid = st.get("id"); v = (m.text or "").strip()
-        okv, msg = guard_text(v, "описании")
-        if not okv: bot.reply_to(m, msg); return
-        try:
-            it = acc.get_item(iid)
-            acc.update_item(iid, name=it.name, price=int(it.price), description=legal_wrap(v), options=getattr(it,"options",None) or [], data_fields=getattr(it,"data_fields",None) or [])
-            bot.reply_to(m, "✅"); show_item(m.chat.id, iid)
-        except Exception as e: bot.reply_to(m, "❌ " + esc(str(e)[:200]))
+        bot.reply_to(m, "🔍 Проверяю...")
+        def _ed():
+            okv, msg = guard_text_ai(v, "описании")
+            if not okv:
+                bot.send_message(m.chat.id, msg); return
+            try:
+                it = acc.get_item(iid)
+                acc.update_item(iid, name=it.name, price=int(it.price), description=legal_wrap(v), options=getattr(it,"options",None) or [], data_fields=getattr(it,"data_fields",None) or [])
+                bot.send_message(m.chat.id, "✅"); show_item(m.chat.id, iid)
+            except Exception as e: bot.send_message(m.chat.id, "❌ " + esc(str(e)[:200]))
+        threading.Thread(target=_ed, daemon=True).start()
     elif a == "disc":
         state.pop(m.chat.id, None)
         try: pct = float((m.text or "").strip().replace(",", "."))
