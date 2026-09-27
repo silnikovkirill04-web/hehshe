@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v11.1 — мастер с data_fields, AI-проверка сообщений."""
+"""KiriillBR Playerok Bot v11.2 — все кнопки, мастер лотов, AI-проверка."""
 import json, logging, os, re, sys, threading, time, urllib.request, base64
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-BOT_VERSION = "11.1"
+BOT_VERSION = "11.2"
 
 # ═══════════════════ ПУТИ ═══════════════════
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -246,7 +246,7 @@ def _to_url(x):
         return ""
     if isinstance(x, bytes): return ""
     if isinstance(x, dict):
-        for k in ("url","link","href","src","path","file_url","fileUrl","preview_url","image_url","download_url"):
+        for k in ("url","link","href","src","path","file_url","preview_url","image_url","download_url"):
             u = _to_url(x.get(k))
             if u: return u
         for v in x.values():
@@ -894,7 +894,6 @@ def show_data_fields(cid):
     except Exception as e:
         L.warning("get_data_fields: %s", e)
         dfs = []
-    # Фильтр: только ITEM_DATA (продавец заполняет). OBTAINING_DATA пропускаем.
     item_fields = []
     for f in dfs:
         t = getattr(f, "type", None)
@@ -909,7 +908,6 @@ def show_data_fields(cid):
         return
     d["data_fields_list"] = []
     for f in item_fields:
-        t = getattr(f, "type", None)
         d["data_fields_list"].append({
             "id": str(getattr(f, "id", "")),
             "label": str(getattr(f, "label", "Поле")),
@@ -934,8 +932,7 @@ def show_data_field(cid, idx):
     save_draft()
     req = "⚠️ ОБЯЗАТЕЛЬНОЕ" if f["required"] else "(необязательное)"
     txt = (f"📋 <b>Поле {idx+1}/{len(lst)}: {esc(f['label'])}</b>\n"
-           f"{req}\n\n"
-           f"Пришли значение:")
+           f"{req}\n\nПришли значение:")
     kb = K(row_width=1)
     if not f["required"]:
         kb.add(B("⏭ Пропустить", callback_data="cr_df_skip"))
@@ -965,14 +962,12 @@ def finalize_draft(cid, desc):
     d = DRAFT.get(str(cid)) or {}
     d["description"] = desc
     save_draft()
-
     ok_n, hits_n = validate_text(d.get("name", ""))
     ok_d, hits_d = validate_text(desc)
     if not ok_n or not ok_d:
         hits = list(dict.fromkeys(hits_n + hits_d))
         send(cid, "⚠️ <b>Заблокировано</b>\n\n" + ", ".join(hits) + "\n\nПопробуй /start и создай заново")
         DRAFT.pop(str(cid), None); save_draft(); return
-
     send(cid, "⏳ Создаю лот...")
     def _create():
         try:
@@ -981,9 +976,7 @@ def finalize_draft(cid, desc):
             opt_map = d.get("options_map", {})
             for k, v in (d.get("options_selected") or {}).items():
                 key = f"{k}={v}"
-                if key in opt_map:
-                    selected_opts.append(opt_map[key])
-            # data_fields
+                if key in opt_map: selected_opts.append(opt_map[key])
             df_payload = []
             for item in (d.get("data_fields_filled") or []):
                 df_payload.append({"id": item["id"], "value": item["value"]})
@@ -996,21 +989,15 @@ def finalize_draft(cid, desc):
                 "data_fields": df_payload,
                 "attachments": [],
             }
-            if d.get("obt_id"):
-                kw["obtaining_type_id"] = d["obt_id"]
-            try:
-                it = acc.create_item(**kw)
-            except TypeError as e:
-                L.warning("create_item TypeError: %s", e)
+            if d.get("obt_id"): kw["obtaining_type_id"] = d["obt_id"]
+            try: it = acc.create_item(**kw)
+            except TypeError:
                 kw.pop("obtaining_type_id", None)
                 it = acc.create_item(**kw)
-
             iid = str(g(it, "id", default=""))
             L.info("created item: %s", iid)
             DRAFT.pop(str(cid), None); save_draft()
             send(cid, "✅ <b>Лот создан!</b>\n🆔 <code>" + esc(iid) + "</code>")
-
-            # Публикация
             try:
                 sts = acc.get_item_priority_statuses(iid, int(d["price"]))
                 free = None
@@ -1236,8 +1223,7 @@ def cb(c):
         except Exception: p = 0
         show_games(cid, page=p)
     elif a.startswith("cr_game:"):
-        gid = a[8:]
-        show_categories(cid, gid)
+        gid = a[8:]; show_categories(cid, gid)
     elif a.startswith("cr_cat:"):
         _, rest = a.split(":", 1)
         parts = rest.split("|", 1)
@@ -1245,14 +1231,12 @@ def cb(c):
     elif a.startswith("cr_obt:"):
         oid = a[7:]
         d = DRAFT.get(str(cid)) or {}
-        d["obt_id"] = oid
-        save_draft()
+        d["obt_id"] = oid; save_draft()
         show_options(cid)
     elif a.startswith("cr_opt_skip:"):
         f = a[12:]
         d = DRAFT.get(str(cid)) or {}
-        d.setdefault("options_selected", {})
-        save_draft()
+        d.setdefault("options_selected", {}); save_draft()
         next_options_field(cid)
     elif a.startswith("cr_opt:"):
         rest = a[7:]
@@ -1266,8 +1250,7 @@ def cb(c):
         d = DRAFT.get(str(cid)) or {}
         idx = d.get("current_df_idx", 0)
         lst = d.get("data_fields_list", [])
-        if idx < len(lst):
-            lst[idx]["value"] = None
+        if idx < len(lst): lst[idx]["value"] = None
         save_draft()
         next_data_field(cid)
     # ─── ЛОТЫ ───
@@ -1459,11 +1442,9 @@ def handle_text(m):
             bot.reply_to(m, "✅ Добро пожаловать! /start"); return
         bot.reply_to(m, "🔐 Введи пароль:"); return
 
-    # Черновик создания лота
     d = DRAFT.get(str(m.chat.id))
     if d:
-        step = d.get("step")
-        text = (m.text or "").strip()
+        step = d.get("step"); text = (m.text or "").strip()
         if text.lower() in ("/cancel", "отмена"):
             DRAFT.pop(str(m.chat.id), None); save_draft()
             bot.reply_to(m, "❌ Отменено"); return
@@ -1472,11 +1453,9 @@ def handle_text(m):
             lst = d.get("data_fields_list", [])
             if idx < len(lst):
                 lst[idx]["value"] = text
-                if "data_fields_filled" not in d:
-                    d["data_fields_filled"] = []
+                if "data_fields_filled" not in d: d["data_fields_filled"] = []
                 d["data_fields_filled"].append({"id": lst[idx]["id"], "value": text})
-            save_draft()
-            next_data_field(m.chat.id); return
+            save_draft(); next_data_field(m.chat.id); return
         if step == "name":
             okv, msg = guard_text(text, "названии")
             if not okv: bot.reply_to(m, msg); return
