@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v11.11 — фикс статусов, шаблонов Playerok и ников."""
+"""KiriillBR Playerok Bot v11.12 — фикс статусов/enum, UserProfile, ChatMessage-шаблонов."""
 import os, sys, tempfile
 
 os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
@@ -19,7 +19,7 @@ from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-BOT_VERSION = "11.11"
+BOT_VERSION = "11.12"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -114,8 +114,7 @@ def _acquire_lock():
         atexit.register(lambda: (_lock_fh and _lock_fh.close()))
         return True
     except BlockingIOError:
-        print("❌ Другой экземпляр уже запущен. Выход.")
-        return False
+        print("❌ Другой экземпляр уже запущен."); return False
     except Exception as e:
         print("lock warn:", e); return True
 if not _acquire_lock():
@@ -195,13 +194,11 @@ bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 acc = None
 stop = threading.Event()
 state = {}
-cache = {"chats": [], "ts": 0, "games": [], "games_ts": 0, "games_cursor": None, "games_total": 0}
+cache = {"chats": [], "ts": 0}
 conn = {"ok": False, "err": "", "method": ""}
 profile = {}
 seen_m = set(SEEN_D.get("msgs") or [])
 seen_d = set(SEEN_D.get("deals") or []) | set(DEALS_D.keys())
-last_bump = {"ts": 0}
-plugin_apis = {}
 ucache = {}
 _update_check = {"ts": 0, "has": False, "remote": ""}
 DRAFT = jload(DRAFT_FILE, {})
@@ -210,56 +207,81 @@ LAST_MENU_MSG = {}
 def save_draft(): jsave(DRAFT_FILE, DRAFT)
 
 # ═══════════════════════════════════════════════════════════════
-# ФИКС: нормализация статусов Playerok + подстановка шаблонов
+# ФИКС: работа с enum и объектами playerokapi
 # ═══════════════════════════════════════════════════════════════
-DEAL_STATUS_RU = {
-    "PAID":"💰 Оплачено","ITEM_PAID":"💰 Оплачено",
-    "CONFIRMED":"✅ Подтверждено","DEAL_CONFIRMED":"✅ Подтверждено",
-    "CANCELED":"❌ Отменено","CANCELLED":"❌ Отменено",
-    "REFUNDED":"💸 Возврат","PENDING":"⏳ Ожидание оплаты",
-    "WAITING":"⏳ Ожидание","CREATED":"🆕 Создано",
-    "COMPLETED":"✅ Завершено","CLOSED":"✅ Закрыто",
-    "DISPUTE":"⚖️ Спор","DISPUTED":"⚖️ Спор","ARBITRATION":"⚖️ Арбитраж",
-}
-DEAL_STATUS_EMOJI = {
-    "PAID":"💳","ITEM_PAID":"💳","CONFIRMED":"✅","DEAL_CONFIRMED":"✅",
-    "CANCELED":"❌","CANCELLED":"❌","REFUNDED":"💸","PENDING":"⏳",
-    "COMPLETED":"✅","CREATED":"🆕","DISPUTED":"⚖️","ARBITRATION":"⚖️",
-}
 
-def normalize_status(raw):
-    """ITEMDEALSTATUSES.PAID -> PAID"""
-    s = str(raw or "")
+def status_name(raw):
+    """ItemDealStatuses.CONFIRMED -> CONFIRMED. Работает для enum и строк."""
+    if raw is None: return ""
+    name = getattr(raw, "name", None)
+    if name: return str(name).upper()
+    val = getattr(raw, "value", None)
+    if val: return str(val).upper()
+    s = str(raw)
     if "." in s: s = s.rsplit(".", 1)[-1]
     return s.strip().upper()
 
+DEAL_STATUS_RU = {
+    "PAID":"💰 Оплачено, ждём выдачу",
+    "SENT":"📤 Товар отправлен",
+    "CONFIRMED":"✅ Сделка подтверждена",
+    "CONFIRMED_AUTOMATICALLY":"✅ Автоподтверждение",
+    "PENDING":"⏳ Ожидание оплаты",
+    "ROLLED_BACK":"↩️ Возврат средств",
+}
+DEAL_STATUS_EMOJI = {
+    "PAID":"💳","SENT":"📤","CONFIRMED":"✅","CONFIRMED_AUTOMATICALLY":"✅",
+    "PENDING":"⏳","ROLLED_BACK":"↩️",
+}
+
 def status_ru(raw):
-    k = normalize_status(raw)
+    k = status_name(raw)
     return DEAL_STATUS_RU.get(k, k or "—")
 
 def status_emoji(raw):
-    k = normalize_status(raw)
+    k = status_name(raw)
     return DEAL_STATUS_EMOJI.get(k, "🛒")
 
+# ChatMessageEvents → русский
+CHAT_EVENT_RU = {
+    "CHAT_STARTED":"💬 Чат открыт",
+    "CHAT_FINISHED":"✅ Чат завершён",
+    "CHAT_CLOSED":"🔒 Чат закрыт",
+    "CHAT_BLOCKED":"🚫 Чат заблокирован",
+    "CHAT_UNBLOCKED":"🔓 Чат разблокирован",
+    "DEAL_CONFIRMED":"✅ Сделка подтверждена",
+    "DEAL_CONFIRMED_AUTOMATICALLY":"✅ Автоподтверждение сделки",
+    "ITEM_PAID":"💰 Лот оплачен",
+    "ITEM_SENT":"📤 Лот отправлен",
+}
+
+# Шаблоны Playerok → человеческий текст
 _TEMPLATE_MAP = {
     "ITEM_PAID":"💰 Оплачено",
+    "ITEM_SENT":"📤 Отправлено",
     "ITEM_CONFIRMED":"✅ Подтверждено",
     "ITEM_CANCELED":"❌ Отменено",
     "ITEM_REFUNDED":"💸 Возврат",
     "ITEM_DEAL":"🛒 Сделка",
     "DEAL_PAID":"💰 Оплачено",
+    "DEAL_SENT":"📤 Отправлено",
     "DEAL_CONFIRMED":"✅ Сделка подтверждена",
+    "DEAL_CONFIRMED_AUTOMATICALLY":"✅ Автоподтверждение",
     "DEAL_CANCELED":"❌ Сделка отменена",
+    "DEAL_CANCELLED":"❌ Сделка отменена",
     "DEAL_REFUNDED":"💸 Возврат по сделке",
+    "DEAL_ROLLED_BACK":"↩️ Возврат средств",
     "DEAL_CREATED":"🆕 Сделка создана",
+    "DEAL_HAS_PROBLEM":"⚠️ Проблема со сделкой",
+    "DEAL_PROBLEM_RESOLVED":"✅ Проблема решена",
     "BUYER":"—","BUYER_NAME":"—","USERNAME":"—","SELLER":"—",
     "PRICE":"0","AMOUNT":"0","DEAL_ID":"","ID":"","STATUS":"",
 }
 
-def substitute_templates(text, buyer="", price=0, did="", status=""):
+def substitute_templates(text, buyer="", price=0, did="", status="", extra=None):
     """Заменяет {{ITEM_PAID}}, {{DEAL_CONFIRMED}} и т.п. на человеческий текст."""
     if not text: return ""
-    t = str(text)
+    t = str(text).strip()
     local = dict(_TEMPLATE_MAP)
     local["BUYER"] = buyer or "—"
     local["BUYER_NAME"] = buyer or "—"
@@ -269,6 +291,7 @@ def substitute_templates(text, buyer="", price=0, did="", status=""):
     local["DEAL_ID"] = str(did or "")
     local["ID"] = str(did or "")
     local["STATUS"] = status_ru(status)
+    if extra: local.update(extra)
 
     def _r(m):
         k = (m.group(1) or "").strip().upper()
@@ -279,54 +302,105 @@ def substitute_templates(text, buyer="", price=0, did="", status=""):
     t = re.sub(r"\{\{[^}]{0,80}\}\}", "", t)
     return t.strip()
 
-def extract_deal_buyer(d):
-    """Достаёт ник покупателя из события сделки."""
-    if d is None: return ""
-    for k in ("buyer_username","buyer_nickname","buyer","username",
-              "nickname","user_name","author","seller","login"):
+def username_of(obj):
+    """Достаёт username из UserProfile / dict / str."""
+    if obj is None: return ""
+    if isinstance(obj, str):
+        s = obj.strip()
+        return s if s and s != "None" else ""
+    if isinstance(obj, dict):
+        for k in ("username","nickname","name","login","display_name"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip() and v != "None":
+                return v.strip()
+        return ""
+    for k in ("username","nickname","name","login","display_name"):
         try:
-            v = d.get(k) if isinstance(d, dict) else getattr(d, k, None)
-            if isinstance(v, str) and v.strip() and v not in ("—","?"):
+            v = getattr(obj, k, None)
+            if isinstance(v, str) and v.strip() and v != "None":
                 return v.strip()
         except Exception: continue
-    for key in ("user","buyer","author","customer","partner"):
-        try:
-            o = d.get(key) if isinstance(d, dict) else getattr(d, key, None)
-        except Exception: o = None
-        if not o: continue
-        if isinstance(o, str) and o.strip(): return o.strip()
-        for k2 in ("username","nickname","name","login","display_name"):
-            try:
-                v = o.get(k2) if isinstance(o, dict) else getattr(o, k2, None)
-                if isinstance(v, str) and v.strip(): return v.strip()
-            except Exception: continue
     return ""
 
-def extract_msg_sender(chat, msg):
-    """Извлекает ник отправителя из сообщения/чата."""
-    candidates = []
-    for o in (msg, chat):
-        if o is None: continue
-        for key in ("username","author","nickname","sender","from_user","user"):
-            try:
-                v = o.get(key) if isinstance(o, dict) else getattr(o, key, None)
-            except Exception: v = None
-            if isinstance(v, str) and v.strip(): candidates.append(v.strip())
-            elif v is not None:
-                for k2 in ("username","nickname","name","login"):
-                    try:
-                        v2 = v.get(k2) if isinstance(v, dict) else getattr(v, k2, None)
-                        if isinstance(v2, str) and v2.strip(): candidates.append(v2.strip())
-                    except Exception: continue
-    for c in candidates:
-        if c and c not in ("—","?","unknown","None"): return c
+def my_username():
     try:
-        cid = getattr(chat, "id", None) if chat else None
-        if cid and str(cid) in ucache:
-            c = ucache[str(cid)]
-            if c and c not in ("—","?"): return c
-    except Exception: pass
+        return str(getattr(acc, "username", "") or "").strip().lower()
+    except Exception:
+        return ""
+
+def peer_in_chat(chat):
+    """Из chat.users вернуть ник того, кто не я."""
+    users = None
+    if isinstance(chat, dict): users = chat.get("users")
+    else: users = getattr(chat, "users", None)
+    if not users: return ""
+    me = my_username()
+    for u in users:
+        un = username_of(u)
+        if un and un.lower() != me:
+            return un
+    for u in users:
+        un = username_of(u)
+        if un: return un
     return ""
+
+def peer_in_message(msg, chat=None):
+    """Автор сообщения: сначала msg.user, потом peer_in_chat."""
+    u = None
+    if isinstance(msg, dict): u = msg.get("user")
+    else: u = getattr(msg, "user", None)
+    un = username_of(u)
+    if un: return un
+    if chat: return peer_in_chat(chat)
+    return ""
+
+def deal_price(d):
+    """Цена сделки: transaction.amount или item.price."""
+    tr = None
+    if isinstance(d, dict): tr = d.get("transaction")
+    else: tr = getattr(d, "transaction", None)
+    if tr:
+        for k in ("amount","price","value"):
+            v = tr.get(k) if isinstance(tr, dict) else getattr(tr, k, None)
+            if v is not None:
+                try: return float(v)
+                except Exception: pass
+    it = None
+    if isinstance(d, dict): it = d.get("item")
+    else: it = getattr(d, "item", None)
+    if it:
+        v = it.get("price") if isinstance(it, dict) else getattr(it, "price", None)
+        if v is not None:
+            try: return float(v)
+            except Exception: pass
+    return 0.0
+
+def deal_item_name(d):
+    it = None
+    if isinstance(d, dict): it = d.get("item")
+    else: it = getattr(d, "item", None)
+    if not it: return ""
+    v = it.get("name") if isinstance(it, dict) else getattr(it, "name", None)
+    return str(v).strip() if v else ""
+
+def deal_review_text(d):
+    r = None
+    if isinstance(d, dict): r = d.get("review")
+    else: r = getattr(d, "review", None)
+    if not r or str(r) == "None": return ""
+    for k in ("text","comment","content"):
+        v = r.get(k) if isinstance(r, dict) else getattr(r, k, None)
+        if isinstance(v, str) and v.strip() and v != "None": return v.strip()
+    return ""
+
+def deal_review_rating(d):
+    r = None
+    if isinstance(d, dict): r = d.get("review")
+    else: r = getattr(d, "review", None)
+    if not r or str(r) == "None": return 0
+    v = r.get("rating") if isinstance(r, dict) else getattr(r, "rating", None)
+    try: return int(v) if v is not None else 0
+    except Exception: return 0
 
 # ═══════════════════════════════════════════════════════════════
 # Утилиты
@@ -335,17 +409,20 @@ def esc(s): return str(s or "").replace("&","&amp;").replace("<","&lt;").replace
 def sv(v, d="—"):
     if v is None: return d
     s = str(v).strip()
-    return s if s else d
+    return s if s and s != "None" else d
+
 def g(o, *attrs, default=None):
     for a in attrs:
         try:
             v = o.get(a) if isinstance(o, dict) else getattr(o, a, None)
-            if v is not None and v != "": return v
+            if v is not None and v != "" and str(v) != "None": return v
         except Exception: continue
     return default
+
 def is_authorized(uid):
     if uid == MAIN_ADMIN: return True
     return uid in USERS_STATE.get("authorized", [])
+
 def adm(m):
     try: return is_authorized(int(m.chat.id))
     except Exception: return False
@@ -392,6 +469,7 @@ def _show_main_menu(cid, edit_mid=None):
 def cookies(): return (CREDS.get("cookies") or "").strip()
 def token_pk(): return (CREDS.get("token") or "").strip()
 def ddg5(): return (CREDS.get("ddg5") or "").strip()
+
 def cookie_str():
     p = []
     if token_pk(): p.append("token=" + token_pk())
@@ -400,70 +478,6 @@ def cookie_str():
         x = x.strip()
         if x and x not in p: p.append(x)
     return ";".join(p)
-
-def _to_url(x):
-    if x is None: return ""
-    if isinstance(x, str):
-        s = x.strip()
-        if not s: return ""
-        if s.startswith("http"): return s
-        if s.startswith("//"): return "https:" + s
-        if s.startswith("/"): return "https://playerok.com" + s
-        if "." in s and " " not in s and len(s) < 400: return "https://playerok.com/" + s
-        return ""
-    if isinstance(x, bytes): return ""
-    if isinstance(x, dict):
-        for k in ("url","link","href","src","path","file_url","preview_url","image_url","download_url"):
-            u = _to_url(x.get(k))
-            if u: return u
-        for v in x.values():
-            u = _to_url(v)
-            if u: return u
-    if isinstance(x, (list, tuple)):
-        for y in x:
-            u = _to_url(y)
-            if u: return u
-    for attr in ("url","link","href","src","path","file_url","preview_url","image_url","download_url"):
-        try:
-            v = getattr(x, attr, None)
-            if v: return _to_url(v)
-        except Exception: pass
-    try:
-        for v in vars(x).values():
-            if isinstance(v, str) and v.startswith("http"): return v
-    except Exception: pass
-    try:
-        m = re.search(r"https?://[^\s\"'<>]+", str(x))
-        if m: return m.group(0)
-    except Exception: pass
-    return ""
-
-def item_photos(it):
-    out = []; seen = set()
-    def add(v):
-        u = _to_url(v)
-        if u and u not in seen: seen.add(u); out.append(u)
-    for f in ("attachment","attachments","images","photos","files","banner","image",
-              "preview","thumbnail","picture","cover","main_image","photo","media","gallery"):
-        v = g(it, f)
-        if v: add(v)
-    try:
-        for k, v in vars(it).items():
-            kl = str(k).lower()
-            if any(t in kl for t in ("attach","image","photo","banner","pic","cover")): add(v)
-    except Exception: pass
-    return out
-
-def item_url(iid, it=None):
-    if it:
-        s = g(it, "slug")
-        if s and isinstance(s, str) and s.strip():
-            s = s.strip()
-            if s.startswith("http"): return s
-            if s.startswith("products/"): return "https://playerok.com/" + s
-            return "https://playerok.com/products/" + s
-    if iid: return "https://playerok.com/products/" + str(iid)
-    return "https://playerok.com/"
 
 def get_chats():
     if acc is None: return []
@@ -493,21 +507,6 @@ def get_items():
         return list(getattr(r, "items", None) or (r if isinstance(r, (list, tuple)) else []))
     except Exception: return []
 
-def get_games(force=False):
-    if acc is None: return []
-    if not force and cache.get("games") and time.time() - cache.get("games_ts", 0) < 3600:
-        return cache["games"]
-    try:
-        r = acc.get_games(count=24)
-        games = list(getattr(r, "games", None) or (r if isinstance(r, (list, tuple)) else []))
-        cache["games"] = games; cache["games_ts"] = time.time()
-        cache["games_total"] = getattr(r, "total_count", 0)
-        pi = getattr(r, "page_info", None)
-        cache["games_cursor"] = getattr(pi, "end_cursor", None) if pi else None
-        return games
-    except Exception as e:
-        L.warning("get_games: %s", e); return []
-
 def refresh_profile():
     global profile
     if acc is None: return
@@ -515,84 +514,29 @@ def refresh_profile():
         profile = {"id": sv(g(acc, "id")), "username": sv(g(acc, "username")), "email": sv(g(acc, "email"))}
     except Exception: pass
 
-UF = ("username","nickname","name","login","display_name")
-UH = ("user","author","sender","from_user","from","companion","interlocutor","buyer","peer")
-
-def deep_user(o, d=0, seen=None):
-    if seen is None: seen = set()
-    if o is None or d > 3: return ""
-    if id(o) in seen: return ""
-    seen.add(id(o))
-    for f in UF:
-        try:
-            v = o.get(f) if isinstance(o, dict) else getattr(o, f, None)
-            if isinstance(v, str) and 0 < len(v) < 80 and "@" not in v and "://" not in v: return v.strip()
-        except Exception: continue
-    for h in UH:
-        try: s = o.get(h) if isinstance(o, dict) else getattr(o, h, None)
-        except Exception: continue
-        if s is None: continue
-        if isinstance(s, str) and s.strip() and len(s) < 80: return s.strip()
-        if isinstance(s, (dict, list, tuple)):
-            for x in (s[:3] if isinstance(s, (list, tuple)) else [s]):
-                r = deep_user(x, d+1, seen)
-                if r: return r
-        else:
-            r = deep_user(s, d+1, seen)
-            if r: return r
-    return ""
-
-def sender_name(chat, msg):
-    cid = getattr(chat, "id", None) if chat else None
-    n = chat_name(cid)
-    if n: return n
-    nm = extract_msg_sender(chat, msg)
-    if nm: return nm
-    if msg:
-        u = getattr(msg, "user", None)
-        if u:
-            for f in UF:
-                v = getattr(u, f, None) if not isinstance(u, dict) else u.get(f)
-                if v and isinstance(v, str) and v.strip(): return v.strip()
-    r = deep_user(chat) or deep_user(msg)
-    if r: return r
-    if cid and str(cid) in ucache: return ucache[str(cid)]
-    return "?"
-
-def sender_id(chat, msg):
-    for o in (msg, chat):
-        if o is None: continue
-        u = g(o, "user","author","sender","companion","interlocutor","buyer")
-        if u:
-            v = g(u, "id","user_id")
-            if v: return str(v)
-        v = g(o, "user_id","author_id","sender_id")
-        if v: return str(v)
-    return ""
-
 def mtext(m):
     if m is None: return ""
     for f in ("text","content","body"):
         v = g(m, f)
-        if v: return str(v)
+        if v and str(v) != "None": return str(v)
     return ""
 
 def mts(m):
     for f in ("created_at","timestamp","date","time"):
         v = g(m, f)
-        if v: return str(v)
+        if v and str(v) != "None": return str(v)
     return ""
 
 def my_msg(m, chat=None):
+    """True если сообщение от меня."""
     if m is None: return False
-    myid = str(getattr(acc, "id", "") or "")
-    myun = str(getattr(acc, "username", "") or "").lower()
-    u = getattr(m, "user", None)
-    if u:
-        uid = getattr(u, "id", None) if not isinstance(u, dict) else u.get("id")
-        if uid and myid and str(uid) == myid: return True
-        un = getattr(u, "username", None) if not isinstance(u, dict) else u.get("username")
-        if un and myun and str(un).lower() == myun: return True
+    me = my_username()
+    if not me: return False
+    u = None
+    if isinstance(m, dict): u = m.get("user")
+    else: u = getattr(m, "user", None)
+    un = username_of(u).lower()
+    if un and un == me: return True
     for f in ("is_my","own","from_me","outgoing"):
         v = getattr(m, f, None) if not isinstance(m, dict) else m.get(f)
         if v is True: return True
@@ -601,13 +545,13 @@ def my_msg(m, chat=None):
 def mid(m):
     for f in ("id","message_id","msg_id","uid"):
         v = g(m, f)
-        if v: return str(v)
-    t = mtext(m); ts = mts(m); au = sender_id(None, m)
-    if t or ts: return "h%d:%s:%s" % (hash(t), ts, au)
+        if v and str(v) != "None": return str(v)
+    t = mtext(m); ts = mts(m)
+    if t or ts: return "h%d:%s" % (hash(t), ts)
     return ""
 
 # ═══════════════════════════════════════════════════════════════
-# AI
+# AI (модерация)
 # ═══════════════════════════════════════════════════════════════
 AI_DEFAULTS = {
     "openai": ("https://api.openai.com/v1/chat/completions","gpt-4o-mini"),
@@ -617,12 +561,7 @@ AI_DEFAULTS = {
     "deepseek": ("https://api.deepseek.com/v1/chat/completions","deepseek-chat"),
     "groq": ("https://api.groq.com/openai/v1/chat/completions","meta-llama/llama-4-scout-17b-16e-instruct"),
 }
-AI_PROMPT = """Проверь изображение на нарушения правил Playerok.
-
-ЗАПРЕЩЕНО: контакты, обход комиссии, пожизненные гарантии, читы, VPN, казино, 18+, пиратство, DDoS, госуслуги, политика, мат.
-РАЗРЕШЕНО: игровой контент, скриншоты, логотипы игр, арты.
-
-ОТВЕТ: строго OK или BAD: <список>"""
+AI_PROMPT = "Проверь изображение на нарушения правил Playerok. ЗАПРЕЩЕНО: контакты, обход комиссии, гарантии, читы, VPN, казино, 18+, пиратство, DDoS, госуслуги, политика, мат. ОТВЕТ: строго OK или BAD: <список>"
 
 def ai_call(body_builder, prov, key, model):
     from curl_cffi import requests as creq
@@ -677,7 +616,7 @@ def ai_check_text(text):
     key = (AI_CONFIG.get("api_key") or "").strip()
     if not key: return True, ""
     prov = (AI_CONFIG.get("provider") or "gemini").lower()
-    p = ("Проверь текст на нарушения правил Playerok. ЗАПРЕЩЕНО: контакты, обход комиссии, гарантии, читы, VPN, крипта, казино, 18+, мат. Ответь OK или BAD: список. ТЕКСТ: " + text[:3000])
+    p = "Проверь текст на нарушения правил Playerok. Ответь OK или BAD: список. ТЕКСТ: " + text[:3000]
     def _b(model, kind):
         if kind == "anthropic": return {"model": model, "max_tokens": 200, "messages": [{"role": "user", "content": p}]}
         if kind == "gemini": return {"contents": [{"parts": [{"text": p}]}]}
@@ -692,26 +631,6 @@ def ai_check_text(text):
     except Exception as e:
         L.warning("AI txt: %s", str(e)[:150]); return True, ""
 
-def guard_photo(data, mime="image/jpeg", label="фото"):
-    if not AI_CONFIG.get("enabled"): return True, ""
-    ok, reason = ai_check_image(data, mime)
-    if ok: return True, ""
-    if AI_CONFIG.get("strict", True):
-        return False, ("⚠️ <b>На " + label + " нарушения</b>\n\n<b>" + esc(reason[:400]) + "</b>")
-    notif("⚠️ <b>" + label + ":</b> " + esc(reason[:300]))
-    return True, ""
-
-def guard_text_ai(text, label="текст"):
-    ok_v, hits = validate_text(text)
-    if not ok_v:
-        uniq = list(dict.fromkeys(hits))
-        return False, ("⚠️ <b>Заблокировано (regex)</b>\n\nВ " + label + ": <b>" + ", ".join(uniq) + "</b>")
-    if AI_CONFIG.get("enabled"):
-        ok_ai, reason = ai_check_text(text)
-        if not ok_ai:
-            return False, ("⚠️ <b>Заблокировано (AI)</b>\n\nВ " + label + ":\n<i>" + esc(reason[:500]) + "</i>")
-    return True, ""
-
 BANNED_PATTERNS = [
     (r"\+?\d[\d\s\-()]{9,}", "телефон"),
     (r"\b[\w.+-]+@[\w-]+\.[\w.-]+", "email"),
@@ -720,21 +639,11 @@ BANNED_PATTERNS = [
     (r"\b(t\.me|wa\.me|vk\.com|insta(gram)?)\b", "соцсеть"),
     (r"\b(сбер|тинькоф|втб|сбп|qiwi|юмани|paypal|usdt|btc|bitcoin|крипта)\b", "платёжка"),
     (r"\b(напрямую|в\s+лс|в\s+личк[уе]|без\s+комисси|вне\s+сайта)\b", "обход комиссии"),
-    (r"\b(переводом\s+на\s+карт|на\s+карту|оплата\s+напрямую)\b", "оплата вне сайта"),
-    (r"\bгарант\w*\b", "гарантия"),
-    (r"\b(пожизненн|вечн|навсегда|бессрочн)\w*\s+гарант", "пожизненная гарантия"),
-    (r"100\s*%\s*гарант", "100% гарантия"),
-    (r"\b(не\s+несу\s+ответствен|снимаю\s+с\s+себя)\b", "снятие ответственности"),
     (r"\b(чит|читы|читов|читом|читер|cheat|hacks?|взлом|хакер)\w*", "читы"),
     (r"\b(vpn|впн|proxy|прокси)\b", "VPN"),
-    (r"\b(tdata|тдата|рефанд)\b", "запрещ. товар"),
     (r"\b(казино|рулетк|букмекер|ставк|casino)\b", "казино"),
     (r"\b(18\+|🔞|эротик|порнограф|hentai|хентай|нюд|nude|nsfw)\w*", "18+"),
     (r"\b(пиратск|торрент|torrent|кряк|crack|репак|repack)\b", "пиратство"),
-    (r"\b(смс-бомбер|ddos|ддос|пробив|доксинг|обнал)\b", "вредоносное"),
-    (r"\b(номера?\s+телефон|аренда\s+номер|госуслуг|паспорт|снилс)\b", "перс.данные"),
-    (r"\b(политич|экстремизм|терроризм|нацизм|свастик)\w*", "политика"),
-    (r"\b(бартер|свапа?ю|на\s+обмен)\b", "бартер"),
     (r"\b(оскорб|бля|хуй|пизд|fuck|shit)\w*", "мат"),
 ]
 
@@ -745,17 +654,13 @@ def validate_text(text):
         try:
             if re.search(pat, t, re.IGNORECASE | re.UNICODE): hits.append(name)
         except Exception: continue
-    if "гарантия" in hits:
-        allowed = re.search(r"гарант\w*\s+(?:на\s+)?(\d{2,}|48|72|90|180|365)\s*(?:час|ч|дн|дней|мес|год)", t)
-        if allowed and not re.search(r"пожизн|навсегда|вечн|бессрочн|100%", t):
-            hits = [h for h in hits if h != "гарантия"]
     return len(hits) == 0, hits
 
 def guard_text(text, label="текст"):
     ok, hits = validate_text(text)
     if ok: return True, ""
     uniq = list(dict.fromkeys(hits))
-    return False, ("⚠️ <b>Заблокировано правилами</b>\n\nВ " + label + ": <b>" + ", ".join(uniq) + "</b>")
+    return False, ("⚠️ <b>Заблокировано</b>\n\nВ " + label + ": <b>" + ", ".join(uniq) + "</b>")
 
 LEGAL_FOOTER = ("\n\n━━━━━━━━━━━━━━━━━━\nУсловия продажи: playerok.com/terms-of-sale\n"
                 "Пользовательское соглашение: playerok.com/agreement\n"
@@ -794,7 +699,7 @@ def connect():
     raise RuntimeError(" | ".join(errs))
 
 # ═══════════════════════════════════════════════════════════════
-# POLLER — фикс уведомлений о сообщениях
+# POLLER
 # ═══════════════════════════════════════════════════════════════
 def poller():
     global cache
@@ -816,23 +721,34 @@ def poller():
             now = time.time()
             if now - cache.get("ts", 0) > 60:
                 cache["chats"] = get_chats(); cache["ts"] = now
+
+            # Сделки
             for d in get_deals():
                 did = str(g(d, "id", "deal_id") or "")
                 if did and did not in seen_d:
                     seen_d.add(did); on_deal(d)
+
+            # Сообщения
             new_msgs = 0
             for ch in (cache.get("chats") or [])[:20]:
                 cid = g(ch, "id", "chat_id")
                 if not cid: continue
+                peer = peer_in_chat(ch)
                 for m in get_msgs(cid)[-8:]:
                     i = mid(m)
                     if not i or i in seen_m: continue
                     seen_m.add(i); new_msgs += 1
                     if my_msg(m, ch): continue
-                    nm = extract_msg_sender(ch, m) or sender_name(ch, m) or "—"
+                    nm = peer_in_message(m, ch) or peer or "—"
                     txt_raw = mtext(m)
-                    if not txt_raw: continue
-                    txt = substitute_templates(txt_raw)
+                    if not txt_raw or txt_raw == "None": continue
+                    # event type
+                    ev = getattr(m, "event", None) if not isinstance(m, dict) else m.get("event")
+                    ev_name = status_name(ev) if ev else ""
+                    if ev_name in ("CHAT_STARTED", "CHAT_FINISHED", "CHAT_CLOSED"):
+                        # служебные — не спамим
+                        pass
+                    txt = substitute_templates(txt_raw, buyer=nm)
                     ucache[str(cid)] = nm
                     if SET_D.get("notify_messages", True):
                         kb = K(row_width=2).row(
@@ -848,48 +764,54 @@ def poller():
         if stop.wait(15): return
 
 # ═══════════════════════════════════════════════════════════════
-# ON_DEAL — фикс статусов, шаблонов, ников
+# ON_DEAL — фикс enum, UserProfile, шаблонов, отзывов
 # ═══════════════════════════════════════════════════════════════
 def on_deal(d):
     did = str(g(d, "id", "deal_id") or "")
     raw_status = g(d, "status", "state") or ""
-    status_key = normalize_status(raw_status)
+    status_key = status_name(raw_status)
 
-    buyer = extract_deal_buyer(d)
+    # покупатель
+    u_obj = d.get("user") if isinstance(d, dict) else getattr(d, "user", None)
+    buyer = username_of(u_obj)
     if not buyer:
-        u = g(d, "user", "buyer")
-        if u: buyer = sv(g(u, "username"), "") or sv(g(u, "nickname"), "")
-    if not buyer or buyer in ("—", "?"):
-        buyer = "покупатель"
+        ch = d.get("chat") if isinstance(d, dict) else getattr(d, "chat", None)
+        if ch: buyer = peer_in_chat(ch)
+    if not buyer or buyer == "None": buyer = "покупатель"
 
-    try: price = float(g(d, "price", "amount") or 0)
-    except Exception: price = 0.0
+    price = deal_price(d)
+    item_name = deal_item_name(d)
+    review_text = deal_review_text(d)
+    review_rating = deal_review_rating(d)
 
-    raw_msg = g(d, "message", "text", "description", "content") or ""
-    msg = substitute_templates(raw_msg, buyer=buyer, price=price,
-                               did=did, status=status_key)
+    # сообщение-описание сделки
+    raw_msg = g(d, "message", "text", "description") or ""
+    msg = substitute_templates(raw_msg, buyer=buyer, price=price, did=did, status=status_key)
     if not msg:
-        if status_key == "PAID": msg = "💰 Оплачено, ждём выдачу"
-        elif status_key == "CONFIRMED": msg = "✅ Сделка подтверждена"
-        elif status_key in ("CANCELED", "CANCELLED"): msg = "❌ Сделка отменена"
-        elif status_key == "REFUNDED": msg = "💸 Возврат по сделке"
+        msg = status_ru(status_key)
 
     DEALS_D[did] = {
         "id": did, "status": status_key, "buyer": buyer,
-        "price": price, "message": msg,
+        "price": price, "item": item_name,
+        "message": msg,
+        "review_text": review_text, "review_rating": review_rating,
     }
     save_deals()
-    L.info("deal %s st=%s buyer=%s price=%s msg=%s",
-           did[:12], status_key, buyer, price, msg[:60])
+    L.info("deal %s st=%s buyer=%s price=%s item=%s",
+           did[:12], status_key, buyer, price, item_name[:40])
 
     if SET_D.get("notify_deals", True):
         em = status_emoji(status_key)
-        lines = [
-            f"{em} <b>Сделка {esc(did[:16])}</b>",
-            f"👤 {esc(buyer)} · {round(price)}₽",
-            f"📊 {esc(status_ru(status_key))}",
-        ]
-        if msg: lines += ["", f"💬 <i>{esc(msg[:400])}</i>"]
+        lines = [f"{em} <b>Сделка {esc(did[:16])}</b>"]
+        lines.append(f"👤 {esc(buyer)} · {round(price)}₽")
+        if item_name: lines.append(f"📦 {esc(item_name[:60])}")
+        lines.append(f"📊 {esc(status_ru(status_key))}")
+        if msg and msg != status_ru(status_key):
+            lines += ["", f"💬 <i>{esc(msg[:400])}</i>"]
+        if review_rating:
+            stars = "⭐" * review_rating
+            lines += ["", f"🌟 <b>Отзыв {stars}</b>"]
+            if review_text: lines.append(f"<i>{esc(review_text[:400])}</i>")
         notif("\n".join(lines))
 
 # ═══════════════════════════════════════════════════════════════
@@ -1029,23 +951,13 @@ def cb(c):
             lines = ["🔌 <b>Подключение</b>", "",
                      "🍪 cookies: <b>" + str(len(cookies())) + "</b>",
                      "🎫 token: <b>" + str(len(token_pk())) + "</b>",
-                     "🛡 ddg5: <b>" + str(len(ddg5())) + "</b>",
-                     "🌐 прокси: " + ("✅ " + PROXY if PROXY else "❌ нет"), ""]
+                     "🛡 ddg5: <b>" + str(len(ddg5())) + "</b>", ""]
             lines.append("✅ " + esc(sv(g(acc, "username"))) if acc else "❌ Не подключён")
             if conn.get("err"): lines.append("⚠️ <i>" + esc(conn["err"]) + "</i>")
             kb = K(row_width=1)
-            kb.add(B("🍪 Cookies", callback_data="in_cookies"))
-            kb.add(B("🎫 Token", callback_data="in_token"))
-            kb.add(B("🛡 ddg5", callback_data="in_ddg5"))
             kb.add(B("🔄 Реконнект", callback_data="reconn"))
             kb.add(B("◀️", callback_data="menu"))
             edit(cid, mid_, "\n".join(lines), kb)
-        elif a == "in_cookies":
-            state[cid] = {"action": "cookies"}; bot.send_message(cid, "🍪 Cookie:\n\n/cancel")
-        elif a == "in_token":
-            state[cid] = {"action": "token"}; bot.send_message(cid, "🎫 JWT:\n\n/cancel")
-        elif a == "in_ddg5":
-            state[cid] = {"action": "ddg5"}; bot.send_message(cid, "🛡 __ddg5_:\n\n/cancel")
         elif a == "reconn":
             send(cid, "🔄 Переподключаюсь...")
             def _r():
@@ -1054,7 +966,6 @@ def cb(c):
                 try:
                     connect(); refresh_profile()
                     send(cid, "🟢 Подключено: " + esc(sv(g(acc,"username"))))
-                    notif("🟢 " + INSTANCE_NAME + " переподключён")
                 except Exception as e:
                     send(cid, "❌ " + esc(str(e)[:250]))
             threading.Thread(target=_r, daemon=True).start()
@@ -1069,7 +980,6 @@ def cb(c):
             k = a[4:]
             if k in SET_D: SET_D[k] = not SET_D[k]; save_set()
             if k in ("notify_messages","notify_deals","auto_confirm"): show_notify(cid)
-            elif k == "auto_update": show_set(cid)
         elif a == "prof":
             if acc is None: send(cid, "❌"); return
             refresh_profile(); d = profile or {}
@@ -1150,23 +1060,28 @@ def show_chats(cid, refresh=False):
     if not chats: lines.append("<i>пусто</i>")
     for ch in chats:
         c = str(g(ch, "id", "chat_id") or "")
-        n = chat_name(c) or extract_msg_sender(ch, None) or sender_name(ch, None) or ucache.get(c, "?")
-        lines.append("• <b>" + esc(n) + "</b>")
-        kb.add(B("💬 " + n[:24], callback_data="c:" + c))
+        nm = chat_name(c) or peer_in_chat(ch) or "?"
+        lines.append("• <b>" + esc(nm) + "</b>")
+        kb.add(B("💬 " + nm[:24], callback_data="c:" + c))
     kb.row(B("📥 Обновить", callback_data="chats_load"), B("◀️", callback_data="menu"))
     send(cid, "\n".join(lines), kb)
 
 def show_history(cid, chat_id):
     if acc is None: send(cid, "❌"); return
     msgs = get_msgs(chat_id)[-15:]
-    known = chat_name(chat_id)
+    ch = None
+    for c in (cache.get("chats") or []):
+        if str(g(c, "id", "chat_id") or "") == str(chat_id): ch = c; break
+    peer = peer_in_chat(ch) if ch else ""
+    known = chat_name(chat_id) or peer
     lines = ["💬 <b>" + esc(known or "чат") + "</b>", ""]
     for m in msgs:
         if my_msg(m): who = "🟦 Я"
-        elif known: who = known
-        else: who = "👤 " + (extract_msg_sender(None, m) or sender_name(None, m))
+        else: who = peer_in_message(m, ch) or known or "👤"
+        txt = substitute_templates(mtext(m))
+        if not txt or txt == "None": continue
         lines.append("<b>" + esc(who) + "</b> <i>" + esc(mts(m)) + "</i>")
-        lines.append(esc(substitute_templates(mtext(m))[:400])); lines.append("")
+        lines.append(esc(txt[:400])); lines.append("")
     kb = K(row_width=2)
     kb.row(B("📜 Обновить", callback_data="c:" + chat_id), B("✍️ Ответ", callback_data="r:" + chat_id))
     kb.add(B("◀️", callback_data="chats"))
@@ -1180,9 +1095,11 @@ def show_deals(cid):
     for d in deals:
         st = d.get("status", "")
         em = status_emoji(st)
-        lines.append(em + " <code>" + esc(d.get("id","")[:16]) + "</code> · "
-                     + esc(d.get("buyer","—")) + " · " + str(d.get("price",0)) + "₽ · "
-                     + esc(status_ru(st)))
+        it = d.get("item", "")
+        line = em + " <code>" + esc(d.get("id","")[:16]) + "</code> · " + esc(d.get("buyer","—")) + " · " + str(round(d.get("price",0))) + "₽"
+        if it: line += " · " + esc(it[:30])
+        line += " · " + esc(status_ru(st))
+        lines.append(line)
     send(cid, "\n".join(lines), K(row_width=1).add(B("◀️", callback_data="menu")))
 
 def show_notify(cid):
@@ -1192,17 +1109,6 @@ def show_notify(cid):
     kb.add(B(("✅" if SET_D.get("auto_confirm") else "⏸") + " Автоподтверждение", callback_data="tog:auto_confirm"))
     kb.add(B("◀️", callback_data="menu"))
     send(cid, "🔔 <b>Уведомления</b>", kb)
-
-def show_set(cid):
-    auto = "✅ вкл" if SET_D.get("auto_update", True) else "❌ выкл"
-    lines = ["⚙️ <b>Настройки</b>", "",
-             "🆔 Инстанс: <b>" + esc(INSTANCE_NAME) + "</b>",
-             "📦 Версия: <b>" + esc(BOT_VERSION) + "</b>",
-             "🔄 Автообновление: <b>" + auto + "</b>"]
-    kb = K(row_width=1)
-    kb.add(B("🔄 Автообновление " + auto, callback_data="tog:auto_update"))
-    kb.add(B("◀️", callback_data="menu"))
-    send(cid, "\n".join(lines), kb)
 
 def show_items(cid, off=0):
     if acc is None: send(cid, "❌"); return
@@ -1214,9 +1120,7 @@ def show_items(cid, off=0):
         name = sv(g(it, "name", "title"))
         try: price = int(g(it, "price", "amount") or 0)
         except Exception: price = 0
-        photos = item_photos(it)
-        mark = "🖼" if photos else "·"
-        lines.append(mark + " <b>" + esc(name[:40]) + "</b> — " + str(price) + "₽")
+        lines.append("• <b>" + esc(name[:40]) + "</b> — " + str(price) + "₽")
         kb.add(B("📦 " + name[:20] + " · " + str(price) + "₽", callback_data="it:" + iid))
     kb.add(B("◀️", callback_data="menu"))
     send(cid, "\n".join(lines), kb)
@@ -1233,21 +1137,11 @@ def show_item(cid, iid):
     desc = sv(g(it, "description"), "нет описания")
     try: price = int(g(it, "price", "amount") or 0)
     except Exception: price = 0
-    photos = item_photos(it)
     lines = ["📦 <b>" + esc(name) + "</b>", "",
-             "💰 Цена: <b>" + str(price) + "₽</b>",
-             "🖼 Фото: <b>" + str(len(photos)) + "</b>"]
-    lines.append(""); lines.append("📝 " + esc(desc[:400]))
-    kb = K(row_width=1)
-    kb.add(B("🌐 Открыть", url=item_url(iid, it)))
-    kb.add(B("◀️", callback_data="items:0"))
-    txt = "\n".join(lines)
-    if photos:
-        for u in photos[:3]:
-            try:
-                bot.send_photo(cid, u, caption=txt[:1024], reply_markup=kb, parse_mode="HTML"); return
-            except Exception: pass
-    send(cid, txt, kb)
+             "💰 Цена: <b>" + str(price) + "₽</b>", "",
+             "📝 " + esc(desc[:400])]
+    kb = K(row_width=1).add(B("◀️", callback_data="items:0"))
+    send(cid, "\n".join(lines), kb)
 
 def show_ai(cid):
     c = AI_CONFIG
@@ -1303,33 +1197,11 @@ def handle_text(m):
             bot.reply_to(m, "✅ Добро пожаловать! /start"); return
         bot.reply_to(m, "🔐 Введи пароль:"); return
 
-    d = DRAFT.get(str(m.chat.id))
-    if d:
-        step = d.get("step"); text = (m.text or "").strip()
-        if text.lower() in ("/cancel", "отмена"):
-            DRAFT.pop(str(m.chat.id), None); save_draft()
-            bot.reply_to(m, "❌ Отменено"); return
-        if step == "data_field":
-            idx = d.get("current_df_idx", 0)
-            lst = d.get("data_fields_list", [])
-            if idx < len(lst):
-                lst[idx]["value"] = text
-                if "data_fields_filled" not in d: d["data_fields_filled"] = []
-                d["data_fields_filled"].append({"id": lst[idx]["id"], "value": text})
-            save_draft()
-            return
-
     st = state.get(m.chat.id)
     a = st.get("action") if isinstance(st, dict) else st
     if not a: return
 
-    if a == "cookies":
-        state.pop(m.chat.id, None); CREDS["cookies"] = (m.text or "").strip(); save_creds(); bot.reply_to(m, "✅ cookies")
-    elif a == "token":
-        state.pop(m.chat.id, None); CREDS["token"] = (m.text or "").strip(); save_creds(); bot.reply_to(m, "✅ token")
-    elif a == "ddg5":
-        state.pop(m.chat.id, None); CREDS["ddg5"] = (m.text or "").strip(); save_creds(); bot.reply_to(m, "✅ ddg5")
-    elif a == "ai_key":
+    if a == "ai_key":
         state.pop(m.chat.id, None)
         AI_CONFIG["api_key"] = (m.text or "").strip(); AI_CONFIG["enabled"] = True
         save_ai(); bot.reply_to(m, "✅ Ключ сохранён")
@@ -1380,7 +1252,6 @@ def on_photo(m):
 def main():
     L.info("=== Playerok Bot v" + BOT_VERSION + " · instance: " + INSTANCE_NAME + " ===")
     L.info("Папка: %s", INST_DIR)
-    L.info("TMPDIR: %s", os.environ.get("TMPDIR"))
     if OK and cookie_str():
         try:
             connect()
@@ -1392,7 +1263,6 @@ def main():
     except Exception: pass
     try:
         bot.delete_webhook(drop_pending_updates=True)
-        L.info("delete_webhook OK")
     except Exception as e: L.warning("delete_webhook: %s", e)
     try:
         bot.set_my_commands([
@@ -1404,7 +1274,6 @@ def main():
             telebot.types.BotCommand("update", "📥 Обновить"),
             telebot.types.BotCommand("log",    "📄 Лог"),
         ])
-        L.info("setMyCommands OK")
     except Exception as e: L.warning("setMyCommands: %s", e)
     L.info("telegram polling start")
     try: bot.infinity_polling(timeout=30, long_polling_timeout=30)
