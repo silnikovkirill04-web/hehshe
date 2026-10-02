@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v11.10 — single-instance lock, фикс cacert, фикс меню, внутренняя память."""
+"""KiriillBR Playerok Bot v11.11 — фикс статусов, шаблонов Playerok и ников."""
 import os, sys, tempfile
 
-# ─── FIX: /tmp/cacert.pem + CA bundle ───
 os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
 os.environ.setdefault("REQUESTS_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt")
 os.environ.setdefault("CURL_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt")
@@ -12,14 +11,7 @@ try:
     os.makedirs(_BOT_TMP, exist_ok=True)
     os.environ["TMPDIR"] = _BOT_TMP
     tempfile.tempdir = _BOT_TMP
-except Exception:
-    pass
-try:
-    _stuck = "/tmp/cacert.pem"
-    if os.path.exists(_stuck) and not os.access(_stuck, os.W_OK):
-        os.remove(_stuck)
-except Exception:
-    pass
+except Exception: pass
 
 import json, logging, re, threading, time, urllib.request, base64, fcntl, atexit
 from datetime import datetime
@@ -27,7 +19,7 @@ from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-BOT_VERSION = "11.10"
+BOT_VERSION = "11.11"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -65,10 +57,9 @@ def save_cfg(c): jsave(CONFIG_FILE, c)
 def setup_wizard():
     print("=" * 60); print("  Первый запуск KiriillBR Playerok Bot"); print("=" * 60); print()
     while True:
-        nick = input("Ник бота (латиница/цифры/_-): ").strip()
+        nick = input("Ник бота: ").strip()
         nick = re.sub(r"[^A-Za-z0-9_\-]", "_", nick)[:32]
-        if not nick: print("Пустой"); continue
-        break
+        if nick: break
     cfg = {"instance": nick}
     cfg["token"] = input("1. Токен бота: ").strip()
     cfg["admin_password"] = input("2. Пароль: ").strip()
@@ -79,10 +70,8 @@ def setup_wizard():
     cfg["github_branch"] = "main"
     cfg["github_file"] = "jehsbhw.py"
     cfg["auto_update"] = True
-    cfg["tmpl"] = "Здравствуйте, {buyer}! {message}"
     save_cfg(cfg)
-    print("\n✅ Сохранено:", CONFIG_FILE)
-    print("📁 Инстанс:", os.path.join(BASE_DIR, nick), "\n")
+    print("\n✅ Сохранено:", CONFIG_FILE, "\n")
     return cfg
 
 CFG = load_cfg()
@@ -112,11 +101,9 @@ PLUGINS_DIR   = os.path.join(INST_DIR, "plugins")
 SEEN_FILE     = os.path.join(INST_DIR, "seen.json")
 DRAFT_FILE    = os.path.join(INST_DIR, "draft.json")
 LOG_FILE      = os.path.join(INST_DIR, "bot.log")
-MEM_FILE      = os.path.join(INST_DIR, "memory.json")
 LOCK_FILE     = os.path.join(INST_DIR, "bot.lock")
 os.makedirs(PLUGINS_DIR, exist_ok=True)
 
-# ─── single-instance lock ───
 _lock_fh = None
 def _acquire_lock():
     global _lock_fh
@@ -127,7 +114,7 @@ def _acquire_lock():
         atexit.register(lambda: (_lock_fh and _lock_fh.close()))
         return True
     except BlockingIOError:
-        print("❌ Другой экземпляр этого instance уже запущен. Выход.")
+        print("❌ Другой экземпляр уже запущен. Выход.")
         return False
     except Exception as e:
         print("lock warn:", e); return True
@@ -152,7 +139,6 @@ SET_D = jload(SETTINGS_FILE, {
     "auto_bump": False, "auto_bump_min": 240, "auto_bump_max": 100,
     "auto_update": True, "tmpl": "Здравствуйте, {buyer}! {message}",
 })
-# если settings.json пуст, но в config.json есть значения — подтянем оттуда
 for _k in ("notify_messages","notify_deals","auto_confirm","auto_confirm_delay",
            "auto_bump","auto_bump_min","auto_bump_max","auto_update","tmpl"):
     if _k in CFG and _k not in SET_D:
@@ -167,20 +153,6 @@ AI_CONFIG = jload(AI_FILE, {"enabled": False, "provider": "gemini", "api_key": "
 NAMES_D = jload(NAMES_FILE, {})
 PLUGS_D = jload(PLUGINS_FILE, {})
 SEEN_D = jload(SEEN_FILE, {"msgs": [], "deals": []})
-
-# ─── внутренняя память (без UI) ───
-MEM = jload(MEM_FILE, {
-    "menu_ids": {},     # cid -> message_id главного меню
-    "last_chat": {},    # cid -> chat_id Playerok
-    "last_item": {},    # cid -> item_id
-    "created_at": str(datetime.now()),
-})
-MEM.setdefault("menu_ids", {}); MEM.setdefault("last_chat", {}); MEM.setdefault("last_item", {})
-def save_mem(): jsave(MEM_FILE, MEM)
-def mem_set(sec, k, v):
-    MEM.setdefault(sec, {})[str(k)] = v; save_mem()
-def mem_get(sec, k, d=None):
-    return MEM.get(sec, {}).get(str(k), d)
 
 def save_creds(): jsave(CREDS_FILE, CREDS)
 def save_set(): jsave(SETTINGS_FILE, SET_D)
@@ -233,38 +205,132 @@ plugin_apis = {}
 ucache = {}
 _update_check = {"ts": 0, "has": False, "remote": ""}
 DRAFT = jload(DRAFT_FILE, {})
-
-LAST_MENU_MSG = {int(k): int(v) for k, v in (MEM.get("menu_ids") or {}).items() if str(k).lstrip("-").isdigit()}
+LAST_MENU_MSG = {}
 
 def save_draft(): jsave(DRAFT_FILE, DRAFT)
 
-ITEM_STATUS_RU = {
-    "PENDING_APPROVAL": "⏳ На проверке",
-    "PENDING_MODERATION": "⏳ На модерации",
-    "APPROVED": "✅ Одобрено",
-    "DECLINED": "❌ Отклонено",
-    "BLOCKED": "🚫 Заблокировано",
-    "EXPIRED": "⏰ Истекло",
-    "SOLD": "💰 Продано",
-    "DRAFT": "📝 Черновик",
+# ═══════════════════════════════════════════════════════════════
+# ФИКС: нормализация статусов Playerok + подстановка шаблонов
+# ═══════════════════════════════════════════════════════════════
+DEAL_STATUS_RU = {
+    "PAID":"💰 Оплачено","ITEM_PAID":"💰 Оплачено",
+    "CONFIRMED":"✅ Подтверждено","DEAL_CONFIRMED":"✅ Подтверждено",
+    "CANCELED":"❌ Отменено","CANCELLED":"❌ Отменено",
+    "REFUNDED":"💸 Возврат","PENDING":"⏳ Ожидание оплаты",
+    "WAITING":"⏳ Ожидание","CREATED":"🆕 Создано",
+    "COMPLETED":"✅ Завершено","CLOSED":"✅ Закрыто",
+    "DISPUTE":"⚖️ Спор","DISPUTED":"⚖️ Спор","ARBITRATION":"⚖️ Арбитраж",
+}
+DEAL_STATUS_EMOJI = {
+    "PAID":"💳","ITEM_PAID":"💳","CONFIRMED":"✅","DEAL_CONFIRMED":"✅",
+    "CANCELED":"❌","CANCELLED":"❌","REFUNDED":"💸","PENDING":"⏳",
+    "COMPLETED":"✅","CREATED":"🆕","DISPUTED":"⚖️","ARBITRATION":"⚖️",
 }
 
-def item_status_ru(it):
-    st = g(it, "status", "state")
-    if st is None: return "—"
-    if hasattr(st, "name"): name = str(st.name)
-    elif hasattr(st, "value"): name = str(st.value)
-    else: name = str(st)
-    return ITEM_STATUS_RU.get(name.upper(), name)
+def normalize_status(raw):
+    """ITEMDEALSTATUSES.PAID -> PAID"""
+    s = str(raw or "")
+    if "." in s: s = s.rsplit(".", 1)[-1]
+    return s.strip().upper()
 
-def item_status_desc(it):
-    return sv(g(it, "status_description"), "")
+def status_ru(raw):
+    k = normalize_status(raw)
+    return DEAL_STATUS_RU.get(k, k or "—")
 
-def item_status_exp(it):
-    v = g(it, "status_expiration_date")
-    if not v: return ""
-    return str(v)[:19].replace("T", " ")
+def status_emoji(raw):
+    k = normalize_status(raw)
+    return DEAL_STATUS_EMOJI.get(k, "🛒")
 
+_TEMPLATE_MAP = {
+    "ITEM_PAID":"💰 Оплачено",
+    "ITEM_CONFIRMED":"✅ Подтверждено",
+    "ITEM_CANCELED":"❌ Отменено",
+    "ITEM_REFUNDED":"💸 Возврат",
+    "ITEM_DEAL":"🛒 Сделка",
+    "DEAL_PAID":"💰 Оплачено",
+    "DEAL_CONFIRMED":"✅ Сделка подтверждена",
+    "DEAL_CANCELED":"❌ Сделка отменена",
+    "DEAL_REFUNDED":"💸 Возврат по сделке",
+    "DEAL_CREATED":"🆕 Сделка создана",
+    "BUYER":"—","BUYER_NAME":"—","USERNAME":"—","SELLER":"—",
+    "PRICE":"0","AMOUNT":"0","DEAL_ID":"","ID":"","STATUS":"",
+}
+
+def substitute_templates(text, buyer="", price=0, did="", status=""):
+    """Заменяет {{ITEM_PAID}}, {{DEAL_CONFIRMED}} и т.п. на человеческий текст."""
+    if not text: return ""
+    t = str(text)
+    local = dict(_TEMPLATE_MAP)
+    local["BUYER"] = buyer or "—"
+    local["BUYER_NAME"] = buyer or "—"
+    local["USERNAME"] = buyer or "—"
+    local["PRICE"] = str(round(price)) if price else "0"
+    local["AMOUNT"] = str(round(price)) if price else "0"
+    local["DEAL_ID"] = str(did or "")
+    local["ID"] = str(did or "")
+    local["STATUS"] = status_ru(status)
+
+    def _r(m):
+        k = (m.group(1) or "").strip().upper()
+        if k in local: return str(local[k])
+        k2 = k.rsplit(".", 1)[-1]
+        return str(local.get(k2, ""))
+    t = re.sub(r"\{\{\s*([A-Za-z0-9_.]+)\s*\}\}", _r, t)
+    t = re.sub(r"\{\{[^}]{0,80}\}\}", "", t)
+    return t.strip()
+
+def extract_deal_buyer(d):
+    """Достаёт ник покупателя из события сделки."""
+    if d is None: return ""
+    for k in ("buyer_username","buyer_nickname","buyer","username",
+              "nickname","user_name","author","seller","login"):
+        try:
+            v = d.get(k) if isinstance(d, dict) else getattr(d, k, None)
+            if isinstance(v, str) and v.strip() and v not in ("—","?"):
+                return v.strip()
+        except Exception: continue
+    for key in ("user","buyer","author","customer","partner"):
+        try:
+            o = d.get(key) if isinstance(d, dict) else getattr(d, key, None)
+        except Exception: o = None
+        if not o: continue
+        if isinstance(o, str) and o.strip(): return o.strip()
+        for k2 in ("username","nickname","name","login","display_name"):
+            try:
+                v = o.get(k2) if isinstance(o, dict) else getattr(o, k2, None)
+                if isinstance(v, str) and v.strip(): return v.strip()
+            except Exception: continue
+    return ""
+
+def extract_msg_sender(chat, msg):
+    """Извлекает ник отправителя из сообщения/чата."""
+    candidates = []
+    for o in (msg, chat):
+        if o is None: continue
+        for key in ("username","author","nickname","sender","from_user","user"):
+            try:
+                v = o.get(key) if isinstance(o, dict) else getattr(o, key, None)
+            except Exception: v = None
+            if isinstance(v, str) and v.strip(): candidates.append(v.strip())
+            elif v is not None:
+                for k2 in ("username","nickname","name","login"):
+                    try:
+                        v2 = v.get(k2) if isinstance(v, dict) else getattr(v, k2, None)
+                        if isinstance(v2, str) and v2.strip(): candidates.append(v2.strip())
+                    except Exception: continue
+    for c in candidates:
+        if c and c not in ("—","?","unknown","None"): return c
+    try:
+        cid = getattr(chat, "id", None) if chat else None
+        if cid and str(cid) in ucache:
+            c = ucache[str(cid)]
+            if c and c not in ("—","?"): return c
+    except Exception: pass
+    return ""
+
+# ═══════════════════════════════════════════════════════════════
+# Утилиты
+# ═══════════════════════════════════════════════════════════════
 def esc(s): return str(s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 def sv(v, d="—"):
     if v is None: return d
@@ -315,14 +381,11 @@ def _show_main_menu(cid, edit_mid=None):
         except Exception: pass
     if edit_mid:
         if edit(cid, edit_mid, main_text(), main_kb()):
-            LAST_MENU_MSG[cid] = edit_mid
-            mem_set("menu_ids", cid, edit_mid)
-            return
+            LAST_MENU_MSG[cid] = edit_mid; return
     try:
         msg = bot.send_message(cid, main_text(), reply_markup=main_kb(),
                                disable_web_page_preview=True)
         LAST_MENU_MSG[cid] = msg.message_id
-        mem_set("menu_ids", cid, msg.message_id)
     except Exception as e:
         L.debug("_show_main_menu send: %s", e)
 
@@ -408,24 +471,28 @@ def get_chats():
         r = acc.get_chats()
         return list(getattr(r, "chats", None) or (r if isinstance(r, (list, tuple)) else []))
     except Exception: return []
+
 def get_msgs(cid, n=24):
     if acc is None: return []
     try:
         r = acc.get_chat_messages(cid, count=n)
         return list(getattr(r, "messages", None) or (r if isinstance(r, (list, tuple)) else []))
     except Exception: return []
+
 def get_deals():
     if acc is None: return []
     try:
         r = acc.get_deals()
         return list(getattr(r, "deals", None) or (r if isinstance(r, (list, tuple)) else []))
     except Exception: return []
+
 def get_items():
     if acc is None: return []
     try:
         r = acc.get_my_items()
         return list(getattr(r, "items", None) or (r if isinstance(r, (list, tuple)) else []))
     except Exception: return []
+
 def get_games(force=False):
     if acc is None: return []
     if not force and cache.get("games") and time.time() - cache.get("games_ts", 0) < 3600:
@@ -440,6 +507,7 @@ def get_games(force=False):
         return games
     except Exception as e:
         L.warning("get_games: %s", e); return []
+
 def refresh_profile():
     global profile
     if acc is None: return
@@ -473,34 +541,24 @@ def deep_user(o, d=0, seen=None):
             r = deep_user(s, d+1, seen)
             if r: return r
     return ""
+
 def sender_name(chat, msg):
     cid = getattr(chat, "id", None) if chat else None
     n = chat_name(cid)
     if n: return n
+    nm = extract_msg_sender(chat, msg)
+    if nm: return nm
     if msg:
         u = getattr(msg, "user", None)
         if u:
             for f in UF:
                 v = getattr(u, f, None) if not isinstance(u, dict) else u.get(f)
                 if v and isinstance(v, str) and v.strip(): return v.strip()
-        for ha in ("author","sender","from_user"):
-            h = getattr(msg, ha, None)
-            if h is None: continue
-            if isinstance(h, str) and h.strip(): return h.strip()
-            for f in UF:
-                v = getattr(h, f, None) if not isinstance(h, dict) else h.get(f)
-                if v: return str(v)
-    if chat:
-        for ha in UH:
-            h = getattr(chat, ha, None)
-            if h is None: continue
-            for f in UF:
-                v = getattr(h, f, None) if not isinstance(h, dict) else h.get(f)
-                if v: return str(v)
     r = deep_user(chat) or deep_user(msg)
     if r: return r
     if cid and str(cid) in ucache: return ucache[str(cid)]
     return "?"
+
 def sender_id(chat, msg):
     for o in (msg, chat):
         if o is None: continue
@@ -511,17 +569,20 @@ def sender_id(chat, msg):
         v = g(o, "user_id","author_id","sender_id")
         if v: return str(v)
     return ""
+
 def mtext(m):
     if m is None: return ""
     for f in ("text","content","body"):
         v = g(m, f)
         if v: return str(v)
     return ""
+
 def mts(m):
     for f in ("created_at","timestamp","date","time"):
         v = g(m, f)
         if v: return str(v)
     return ""
+
 def my_msg(m, chat=None):
     if m is None: return False
     myid = str(getattr(acc, "id", "") or "")
@@ -536,6 +597,7 @@ def my_msg(m, chat=None):
         v = getattr(m, f, None) if not isinstance(m, dict) else m.get(f)
         if v is True: return True
     return False
+
 def mid(m):
     for f in ("id","message_id","msg_id","uid"):
         v = g(m, f)
@@ -544,6 +606,9 @@ def mid(m):
     if t or ts: return "h%d:%s:%s" % (hash(t), ts, au)
     return ""
 
+# ═══════════════════════════════════════════════════════════════
+# AI
+# ═══════════════════════════════════════════════════════════════
 AI_DEFAULTS = {
     "openai": ("https://api.openai.com/v1/chat/completions","gpt-4o-mini"),
     "anthropic": ("https://api.anthropic.com/v1/messages","claude-3-5-sonnet-latest"),
@@ -552,17 +617,10 @@ AI_DEFAULTS = {
     "deepseek": ("https://api.deepseek.com/v1/chat/completions","deepseek-chat"),
     "groq": ("https://api.groq.com/openai/v1/chat/completions","meta-llama/llama-4-scout-17b-16e-instruct"),
 }
-AI_PROMPT = """Проверь изображение на нарушения правил маркетплейса Playerok.
+AI_PROMPT = """Проверь изображение на нарушения правил Playerok.
 
-ЗАПРЕЩЕНО (если есть — BAD):
-1. Контакты: телефоны, email, @ники, Telegram, ТГ, WhatsApp, Viber, ВК, Discord, t.me, QR-коды, ссылки
-2. Обход комиссии: напрямую, в лс, в личку, без комиссии, на карту, сбер, тинькоф, USDT, BTC
-3. Гарантии: гарантия, пожизненная, навсегда, 100% гарант, без гарантии, не несу ответственность. РАЗРЕШЕНО: "гарантия 48 часов" и больше
-4. Читы: чит, cheat, hack, взлом
-5. Запрещённые: VPN, proxy, tdata, рефанд, казино, 18+, 🔞, пиратство, торрент, ddos, обнал, номера телефонов, госуслуги
-6. Оформление: имитация офиц. магазина, мат, политика
-
-РАЗРЕШЕНО: игровые скриншоты, логотипы игр, ⚡🔥⭐🎮💰, персонажи, "гарантия 48 часов"
+ЗАПРЕЩЕНО: контакты, обход комиссии, пожизненные гарантии, читы, VPN, казино, 18+, пиратство, DDoS, госуслуги, политика, мат.
+РАЗРЕШЕНО: игровой контент, скриншоты, логотипы игр, арты.
 
 ОТВЕТ: строго OK или BAD: <список>"""
 
@@ -619,7 +677,7 @@ def ai_check_text(text):
     key = (AI_CONFIG.get("api_key") or "").strip()
     if not key: return True, ""
     prov = (AI_CONFIG.get("provider") or "gemini").lower()
-    p = ("Проверь текст на нарушения правил Playerok. ЗАПРЕЩЕНО: контакты, обход комиссии, гарантии (кроме 48ч), читы, VPN, крипта, казино, 18+, мат. Ответь OK или BAD: список. ТЕКСТ: " + text[:3000])
+    p = ("Проверь текст на нарушения правил Playerok. ЗАПРЕЩЕНО: контакты, обход комиссии, гарантии, читы, VPN, крипта, казино, 18+, мат. Ответь OK или BAD: список. ТЕКСТ: " + text[:3000])
     def _b(model, kind):
         if kind == "anthropic": return {"model": model, "max_tokens": 200, "messages": [{"role": "user", "content": p}]}
         if kind == "gemini": return {"contents": [{"parts": [{"text": p}]}]}
@@ -639,7 +697,7 @@ def guard_photo(data, mime="image/jpeg", label="фото"):
     ok, reason = ai_check_image(data, mime)
     if ok: return True, ""
     if AI_CONFIG.get("strict", True):
-        return False, ("⚠️ <b>На " + label + " нарушения</b>\n\n<b>" + esc(reason[:400]) + "</b>\n\nЗамени фото.")
+        return False, ("⚠️ <b>На " + label + " нарушения</b>\n\n<b>" + esc(reason[:400]) + "</b>")
     notif("⚠️ <b>" + label + ":</b> " + esc(reason[:300]))
     return True, ""
 
@@ -647,7 +705,7 @@ def guard_text_ai(text, label="текст"):
     ok_v, hits = validate_text(text)
     if not ok_v:
         uniq = list(dict.fromkeys(hits))
-        return False, ("⚠️ <b>Заблокировано (regex)</b>\n\nВ " + label + ": <b>" + ", ".join(uniq) + "</b>\n\nПравила: playerok.com/terms-of-sale")
+        return False, ("⚠️ <b>Заблокировано (regex)</b>\n\nВ " + label + ": <b>" + ", ".join(uniq) + "</b>")
     if AI_CONFIG.get("enabled"):
         ok_ai, reason = ai_check_text(text)
         if not ok_ai:
@@ -660,28 +718,26 @@ BANNED_PATTERNS = [
     (r"@[A-Za-z][A-Za-z0-9_]{3,}", "@ник"),
     (r"\b(telegram|телеграм|тг|tg|whatsapp|ватсап|viber|вайбер|discord|дискорд)\b", "мессенджер"),
     (r"\b(t\.me|wa\.me|vk\.com|insta(gram)?)\b", "соцсеть"),
-    (r"\b(сбер|тинькоф|втб|сбп|qiwi|юмани|paypal|usdt|btc|bitcoin|крипта)\b", "платёжка/крипта"),
+    (r"\b(сбер|тинькоф|втб|сбп|qiwi|юмани|paypal|usdt|btc|bitcoin|крипта)\b", "платёжка"),
     (r"\b(напрямую|в\s+лс|в\s+личк[уе]|без\s+комисси|вне\s+сайта)\b", "обход комиссии"),
     (r"\b(переводом\s+на\s+карт|на\s+карту|оплата\s+напрямую)\b", "оплата вне сайта"),
     (r"\bгарант\w*\b", "гарантия"),
     (r"\b(пожизненн|вечн|навсегда|бессрочн)\w*\s+гарант", "пожизненная гарантия"),
     (r"100\s*%\s*гарант", "100% гарантия"),
-    (r"\b(не\s+несу\s+ответствен|снимаю\s+с\s+себя|ответственность\s+снимается|не\s+отвечаю\s+за)\b", "снятие ответственности"),
-    (r"\b(чит|читы|читов|читом|читер|cheat|hacks?|взлом|хакер)\w*", "читы/взлом"),
-    (r"\b(vpn|впн|proxy|прокси|обход\s+блокировок)\b", "VPN/proxy"),
-    (r"\b(tdata|тдата|token-акк|cookie-акк|рефанд)\b", "запрещ. товар"),
-    (r"\b(казино|рулетк|букмекер|ставк|casino)\b", "казино/ставки"),
+    (r"\b(не\s+несу\s+ответствен|снимаю\s+с\s+себя)\b", "снятие ответственности"),
+    (r"\b(чит|читы|читов|читом|читер|cheat|hacks?|взлом|хакер)\w*", "читы"),
+    (r"\b(vpn|впн|proxy|прокси)\b", "VPN"),
+    (r"\b(tdata|тдата|рефанд)\b", "запрещ. товар"),
+    (r"\b(казино|рулетк|букмекер|ставк|casino)\b", "казино"),
     (r"\b(18\+|🔞|эротик|порнограф|hentai|хентай|нюд|nude|nsfw)\w*", "18+"),
     (r"\b(пиратск|торрент|torrent|кряк|crack|репак|repack)\b", "пиратство"),
-    (r"\b(кинопоиск|netflix|нетфликс|ivi|okko|кинотеатр)\b", "кинотеатр"),
-    (r"\b(смс-бомбер|ddos|ддос|пробив|доксинг|обнал|дропы?)\b", "вредоносное"),
+    (r"\b(смс-бомбер|ddos|ддос|пробив|доксинг|обнал)\b", "вредоносное"),
     (r"\b(номера?\s+телефон|аренда\s+номер|госуслуг|паспорт|снилс)\b", "перс.данные"),
-    (r"\b(онлайн-курс|заработок\s+\d|финансов\w*\s+пирамид)\w*", "курсы/заработок"),
     (r"\b(политич|экстремизм|терроризм|нацизм|свастик)\w*", "политика"),
-    (r"\b(бартер|свапа?ю|на\s+обмен|обмен\s+на)\b", "бартер"),
-    (r"\b(прайс-лист|список\s+товаров|каталог\s+цен)\b", "прайс-лист"),
+    (r"\b(бартер|свапа?ю|на\s+обмен)\b", "бартер"),
     (r"\b(оскорб|бля|хуй|пизд|fuck|shit)\w*", "мат"),
 ]
+
 def validate_text(text):
     if not text: return True, []
     t = str(text).lower(); hits = []
@@ -694,16 +750,17 @@ def validate_text(text):
         if allowed and not re.search(r"пожизн|навсегда|вечн|бессрочн|100%", t):
             hits = [h for h in hits if h != "гарантия"]
     return len(hits) == 0, hits
+
 def guard_text(text, label="текст"):
     ok, hits = validate_text(text)
     if ok: return True, ""
     uniq = list(dict.fromkeys(hits))
-    return False, ("⚠️ <b>Заблокировано правилами</b>\n\nВ " + label + ": <b>" + ", ".join(uniq) + "</b>\n\nПравила: playerok.com/terms-of-sale")
+    return False, ("⚠️ <b>Заблокировано правилами</b>\n\nВ " + label + ": <b>" + ", ".join(uniq) + "</b>")
 
 LEGAL_FOOTER = ("\n\n━━━━━━━━━━━━━━━━━━\nУсловия продажи: playerok.com/terms-of-sale\n"
                 "Пользовательское соглашение: playerok.com/agreement\n"
-                "Политика конфиденциальности: playerok.com/privacy\n"
-                "Контакты: playerok.com/contacts\n━━━━━━━━━━━━━━━━━━")
+                "Политика конфиденциальности: playerok.com/privacy\n━━━━━━━━━━━━━━━━━━")
+
 def legal_wrap(d):
     d = (d or "").rstrip()
     if "terms-of-sale" in d: return d
@@ -736,6 +793,9 @@ def connect():
         except Exception as e: errs.append(n + ": " + str(e)[:100])
     raise RuntimeError(" | ".join(errs))
 
+# ═══════════════════════════════════════════════════════════════
+# POLLER — фикс уведомлений о сообщениях
+# ═══════════════════════════════════════════════════════════════
 def poller():
     global cache
     L.info("poller started")
@@ -769,11 +829,15 @@ def poller():
                     if not i or i in seen_m: continue
                     seen_m.add(i); new_msgs += 1
                     if my_msg(m, ch): continue
-                    nm = sender_name(ch, m); txt = mtext(m)
-                    if not txt: continue
+                    nm = extract_msg_sender(ch, m) or sender_name(ch, m) or "—"
+                    txt_raw = mtext(m)
+                    if not txt_raw: continue
+                    txt = substitute_templates(txt_raw)
                     ucache[str(cid)] = nm
                     if SET_D.get("notify_messages", True):
-                        kb = K(row_width=2).row(B("📜 15", callback_data="c:" + str(cid)), B("✍️ Ответ", callback_data="r:" + str(cid)))
+                        kb = K(row_width=2).row(
+                            B("📜 15", callback_data="c:" + str(cid)),
+                            B("✍️ Ответ", callback_data="r:" + str(cid)))
                         notif("💬 <b>" + esc(nm) + "</b>\n" + esc(txt[:400]), kb)
             if new_msgs: save_seen()
             try: refresh_profile()
@@ -783,18 +847,54 @@ def poller():
             conn["ok"] = False; conn["err"] = str(e)[:150]; L.exception("poll")
         if stop.wait(15): return
 
+# ═══════════════════════════════════════════════════════════════
+# ON_DEAL — фикс статусов, шаблонов, ников
+# ═══════════════════════════════════════════════════════════════
 def on_deal(d):
     did = str(g(d, "id", "deal_id") or "")
-    st = str(g(d, "status", "state") or "").upper()
-    u = g(d, "user", "buyer")
-    buyer = sv(g(u, "username")) if u else "—"
-    price = float(g(d, "price", "amount") or 0)
-    DEALS_D[did] = {"id": did, "status": st, "buyer": buyer, "price": price}
-    save_deals()
-    em = {"PAID":"💳","CONFIRMED":"✅","CANCELED":"❌"}.get(st, "🛒")
-    if SET_D.get("notify_deals", True):
-        notif(em + " <b>Сделка " + esc(did[:16]) + "</b>\n👤 " + esc(buyer) + " · " + str(round(price)) + "₽ · " + esc(st))
+    raw_status = g(d, "status", "state") or ""
+    status_key = normalize_status(raw_status)
 
+    buyer = extract_deal_buyer(d)
+    if not buyer:
+        u = g(d, "user", "buyer")
+        if u: buyer = sv(g(u, "username"), "") or sv(g(u, "nickname"), "")
+    if not buyer or buyer in ("—", "?"):
+        buyer = "покупатель"
+
+    try: price = float(g(d, "price", "amount") or 0)
+    except Exception: price = 0.0
+
+    raw_msg = g(d, "message", "text", "description", "content") or ""
+    msg = substitute_templates(raw_msg, buyer=buyer, price=price,
+                               did=did, status=status_key)
+    if not msg:
+        if status_key == "PAID": msg = "💰 Оплачено, ждём выдачу"
+        elif status_key == "CONFIRMED": msg = "✅ Сделка подтверждена"
+        elif status_key in ("CANCELED", "CANCELLED"): msg = "❌ Сделка отменена"
+        elif status_key == "REFUNDED": msg = "💸 Возврат по сделке"
+
+    DEALS_D[did] = {
+        "id": did, "status": status_key, "buyer": buyer,
+        "price": price, "message": msg,
+    }
+    save_deals()
+    L.info("deal %s st=%s buyer=%s price=%s msg=%s",
+           did[:12], status_key, buyer, price, msg[:60])
+
+    if SET_D.get("notify_deals", True):
+        em = status_emoji(status_key)
+        lines = [
+            f"{em} <b>Сделка {esc(did[:16])}</b>",
+            f"👤 {esc(buyer)} · {round(price)}₽",
+            f"📊 {esc(status_ru(status_key))}",
+        ]
+        if msg: lines += ["", f"💬 <i>{esc(msg[:400])}</i>"]
+        notif("\n".join(lines))
+
+# ═══════════════════════════════════════════════════════════════
+# AUTO-UPDATE
+# ═══════════════════════════════════════════════════════════════
 def _fetch_remote():
     url = "https://raw.githubusercontent.com/" + GITHUB_REPO + "/" + GITHUB_BRANCH + "/" + GITHUB_FILE
     opener = urllib.request.build_opener()
@@ -803,6 +903,7 @@ def _fetch_remote():
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with opener.open(req, timeout=30) as r:
         return r.read().decode("utf-8")
+
 def do_update(cid):
     if not GITHUB_REPO: send(cid, "❌ GitHub не настроен"); return
     try:
@@ -817,6 +918,7 @@ def do_update(cid):
         os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception as e:
         L.exception("update"); send(cid, "❌ " + esc(str(e)[:200]))
+
 def get_remote_version():
     if not GITHUB_REPO: return None, "нет репо"
     try:
@@ -825,6 +927,7 @@ def get_remote_version():
         if m: return m.group(1), ""
         return None, "не нашёл версию"
     except Exception as e: return None, str(e)[:100]
+
 def check_updates(silent=True):
     remote, err = get_remote_version()
     _update_check["ts"] = time.time()
@@ -835,6 +938,7 @@ def check_updates(silent=True):
     if has and not silent:
         notif("🔄 Доступно: " + esc(remote) + " (текущая " + esc(BOT_VERSION) + ")")
     return has, remote, ""
+
 def auto_update_worker():
     if stop.wait(5 * 60): return
     while not stop.is_set():
@@ -847,302 +951,16 @@ def auto_update_worker():
         except Exception as e: L.warning("auto_update: %s", e)
         if stop.wait(6 * 3600): return
 
-# ═══════════════════ МАСТЕР ═══════════════════
-def draft_start(cid):
-    DRAFT[str(cid)] = {"step": "game"}
-    save_draft()
-    show_games(cid)
-
-def show_games(cid, force=False, page=0, query=None, load_all=False):
-    total_known = cache.get("games_total", 0)
-    if query:
-        try:
-            r = acc.get_games(name=query, count=24)
-            games = list(getattr(r, "games", []) or [])
-            total = getattr(r, "total_count", len(games))
-        except Exception as e:
-            send(cid, "❌ Ошибка поиска: " + esc(str(e)[:200])); return
-        kb = K(row_width=1)
-        for gm in games:
-            gid = str(g(gm, "slug") or g(gm, "id") or "")
-            nm = sv(g(gm, "name"), "?")
-            kb.add(B("🎮 " + nm[:40], callback_data="cr_game:" + gid))
-        kb.row(B("🔍 Искать ещё", callback_data="cr_search"), B("↩️ Все игры", callback_data="cr_games_all"))
-        kb.add(B("❌ Отмена", callback_data="cr_cancel"))
-        head = ("🔍 <b>Поиск: " + esc(query) + "</b>\n"
-                "🎮 Найдено: <b>" + str(total) + "</b> (показано " + str(len(games)) + ")\n\n")
-        if not games: head += "❌ <i>Ничего не найдено</i>"
-        else: head += "Выбери игру:"
-        send(cid, head, kb)
-        return
-    games = list(cache.get("games", []))
-    if load_all:
-        send(cid, "⏳ Загружаю все игры...")
-        all_games = []; cur = None; tries = 0
-        while tries < 60:
-            try:
-                r = acc.get_games(count=24, after_cursor=cur)
-                batch = list(getattr(r, "games", []) or [])
-                total_known = getattr(r, "total_count", total_known)
-                if not batch: break
-                all_games.extend(batch)
-                pi = getattr(r, "page_info", None)
-                cur = getattr(pi, "end_cursor", None) if pi else None
-                if not cur: break
-                tries += 1
-            except Exception as e: L.warning("load all games err: %s", e); break
-        cache["games"] = all_games; cache["games_cursor"] = cur
-        cache["games_total"] = total_known; cache["games_ts"] = time.time()
-        games = all_games
-        send(cid, "✅ Загружено: <b>" + str(len(games)) + "</b>")
-    if not games:
-        try:
-            r = acc.get_games(count=24)
-            games = list(getattr(r, "games", []) or [])
-            pi = getattr(r, "page_info", None)
-            cache["games"] = games
-            cache["games_cursor"] = getattr(pi, "end_cursor", None) if pi else None
-            cache["games_total"] = getattr(r, "total_count", 0)
-            cache["games_ts"] = time.time()
-            total_known = cache["games_total"]
-        except Exception as e:
-            send(cid, "❌ " + esc(str(e)[:200])); return
-    per_page = 8
-    total_loaded = len(games)
-    slice_ = games[page*per_page:(page+1)*per_page]
-    kb = K(row_width=1)
-    for gm in slice_:
-        gid = str(g(gm, "slug") or g(gm, "id") or "")
-        nm = sv(g(gm, "name"), "?")
-        kb.add(B("🎮 " + nm[:40], callback_data="cr_game:" + gid))
-    nav = []
-    if page > 0: nav.append(B("⬅️", callback_data=f"cr_games_p:{page-1}"))
-    if (page+1)*per_page < total_loaded: nav.append(B("➡️", callback_data=f"cr_games_p:{page+1}"))
-    if nav: kb.row(*nav)
-    if total_known and total_loaded < total_known:
-        kb.row(B("📥 Загрузить все (" + str(total_known) + ")", callback_data="cr_games_loadall"))
-    kb.row(B("🔍 Поиск по названию", callback_data="cr_search"), B("🔄 Сброс", callback_data="cr_games_r"))
-    kb.add(B("❌ Отмена", callback_data="cr_cancel"))
-    pages_total = (total_loaded + per_page - 1) // per_page or 1
-    head = ("➕ <b>Создание лота</b>\n\n"
-            "🎮 Загружено: <b>" + str(total_loaded) + "</b> из <b>" + str(total_known) + "</b>\n"
-            "📄 Стр. <b>" + str(page+1) + "/" + str(pages_total) + "</b>\n\n")
-    if not slice_: head += "❌ <i>Пусто</i>"
-    else: head += "Выбери игру:"
-    send(cid, head, kb)
-
-def show_categories(cid, game_id):
-    L.info("show_categories: game_id=%r", game_id)
-    send(cid, "⏳ Загружаю категории для <code>" + esc(str(game_id)[:40]) + "</code>...")
-    gm = None; errs = []
-    try: gm = acc.get_game(slug=game_id)
-    except Exception as e:
-        errs.append("slug: " + str(e)[:100]); L.warning("get_game(slug=%s) fail: %s", game_id, str(e)[:150])
-    if gm is None:
-        try: gm = acc.get_game(id=game_id)
-        except Exception as e: errs.append("id: " + str(e)[:100])
-    if gm is None:
-        try:
-            r = acc.get_games(name=game_id, count=24)
-            games = list(getattr(r, "games", []) or [])
-            for x in games:
-                if str(getattr(x, "slug", "")) == str(game_id) or str(getattr(x, "id", "")) == str(game_id):
-                    gm = acc.get_game(slug=getattr(x, "slug", None)); break
-        except Exception as e: errs.append("search: " + str(e)[:100])
-    if gm is None:
-        send(cid, "❌ Не удалось загрузить игру\n\n<code>" + esc(" | ".join(errs)[:300]) + "</code>"); return
-    cats = list(getattr(gm, "categories", []) or [])
-    if not cats: send(cid, "❌ У игры нет категорий"); return
-    kb = K(row_width=1)
-    for c in cats:
-        cid_ = str(g(c, "id", default=""))
-        nm = sv(g(c, "name"), "?")
-        kb.add(B("📁 " + nm[:40], callback_data="cr_cat:" + str(game_id) + "|" + cid_))
-    kb.row(B("🔍 Поиск по категориям", callback_data=f"cr_searchcat:{game_id}"))
-    kb.add(B("◀️ Назад к играм", callback_data="cr_back_games"))
-    kb.add(B("❌ Отмена", callback_data="cr_cancel"))
-    DRAFT[str(cid)] = {"step": "category", "game_id": game_id, "game_slug": getattr(gm, "slug", game_id)}
-    save_draft()
-    send(cid, "🎮 <b>" + esc(sv(g(gm, "name"), game_id)) + "</b>\n\nВыбери категорию (" + str(len(cats)) + "):", kb)
-
-def show_obtaining(cid, game_id, cat_id):
-    L.info("show_obtaining: game=%r cat=%r", game_id, cat_id)
-    try: cat = acc.get_game_category(cat_id)
-    except Exception as e: send(cid, "❌ " + esc(str(e)[:150])); return
-    try: obts = list(getattr(acc.get_game_category_obtaining_types(cat_id), "obtaining_types", []) or [])
-    except Exception: obts = []
-    DRAFT[str(cid)] = {"step": "obtaining", "game_id": game_id, "cat_id": cat_id, "cat_name": sv(g(cat, "name"), cat_id)}
-    save_draft()
-    if not obts: show_options(cid); return
-    kb = K(row_width=1)
-    for ob in obts:
-        oid = str(g(ob, "id", default=""))
-        nm = sv(g(ob, "name"), "?")
-        kb.add(B("📦 " + nm[:40], callback_data="cr_obt:" + oid))
-    kb.add(B("◀️ Назад", callback_data=f"cr_cat_back:{game_id}"))
-    kb.add(B("❌ Отмена", callback_data="cr_cancel"))
-    send(cid, "📁 <b>" + esc(sv(g(cat, "name"), cat_id)) + "</b>\n\nСпособ передачи:", kb)
-
-def show_options(cid):
-    d = DRAFT.get(str(cid)) or {}
-    cat_id = d.get("cat_id")
-    if not cat_id: send(cid, "❌ Ошибка"); return
-    try: cat = acc.get_game_category(cat_id)
-    except Exception as e: send(cid, "❌ " + esc(str(e)[:150])); return
-    opts = list(getattr(cat, "options", []) or [])
-    fields = {}
-    for o in opts:
-        f = str(getattr(o, "field", "?"))
-        fields.setdefault(f, []).append(o)
-    d["options_fields"] = {k: [str(getattr(x, "value", "")) for x in v] for k, v in fields.items()}
-    d["options_map"] = {}
-    for k, v in fields.items():
-        for x in v:
-            d["options_map"][f"{k}={getattr(x, 'value', '')}"] = x
-    d["options_selected"] = {}
-    d["step"] = "options"; save_draft()
-    if not fields: show_data_fields(cid); return
-    show_options_field(cid, list(fields.keys())[0])
-
-def show_options_field(cid, field):
-    d = DRAFT.get(str(cid)) or {}
-    values = d.get("options_fields", {}).get(field, [])
-    kb = K(row_width=2)
-    for v in values[:40]:
-        kb.add(B(v[:30], callback_data=f"cr_opt:{field}={v}"))
-    kb.row(B("⏭ Пропустить", callback_data=f"cr_opt_skip:{field}"), B("❌ Отмена", callback_data="cr_cancel"))
-    d["current_field"] = field; save_draft()
-    send(cid, f"⚙️ <b>Опция: {esc(field)}</b>\n\nВыбери значение (" + str(len(values)) + "):", kb)
-
-def next_options_field(cid):
-    d = DRAFT.get(str(cid)) or {}
-    fields = list(d.get("options_fields", {}).keys())
-    selected = d.get("options_selected", {})
-    for f in fields:
-        if f not in selected: show_options_field(cid, f); return
-    show_data_fields(cid)
-
-def show_data_fields(cid):
-    d = DRAFT.get(str(cid)) or {}
-    cat_id = d.get("cat_id"); obt_id = d.get("obt_id")
-    if not cat_id:
-        d["step"] = "name"; save_draft()
-        send(cid, "📝 Пришли <b>название</b> лота:\n\n/cancel — отмена"); return
-    try:
-        df_res = acc.get_game_category_data_fields(cat_id, obt_id) if obt_id else None
-        dfs = list(getattr(df_res, "data_fields", []) or []) if df_res else []
-    except Exception as e: L.warning("get_data_fields: %s", e); dfs = []
-    item_fields = []
-    for f in dfs:
-        t = getattr(f, "type", None)
-        tname = str(getattr(t, "name", t) or "").upper()
-        if "ITEM_DATA" in tname: item_fields.append(f)
-    if not item_fields:
-        d["data_fields_filled"] = []
-        d["step"] = "name"; save_draft()
-        send(cid, "ℹ️ Обязательных полей данных нет.\n\n📝 Пришли <b>название</b> лота:\n\n/cancel — отмена"); return
-    d["data_fields_list"] = []
-    for f in item_fields:
-        d["data_fields_list"].append({
-            "id": str(getattr(f, "id", "")),
-            "label": str(getattr(f, "label", "Поле")),
-            "required": bool(getattr(f, "required", False)),
-            "value": None,
-        })
-    d["data_fields_filled"] = []
-    d["step"] = "data_field"; save_draft()
-    show_data_field(cid, 0)
-
-def show_data_field(cid, idx):
-    d = DRAFT.get(str(cid)) or {}
-    lst = d.get("data_fields_list", [])
-    if idx >= len(lst):
-        d["step"] = "name"; save_draft()
-        send(cid, "✅ Данные заполнены.\n\n📝 Пришли <b>название</b> лота:\n\n/cancel — отмена"); return
-    f = lst[idx]
-    d["current_df_idx"] = idx; save_draft()
-    req = "⚠️ ОБЯЗАТЕЛЬНОЕ" if f["required"] else "(необязательное)"
-    txt = (f"📋 <b>Поле {idx+1}/{len(lst)}: {esc(f['label'])}</b>\n{req}\n\nПришли значение:")
-    kb = K(row_width=1)
-    if not f["required"]: kb.add(B("⏭ Пропустить", callback_data="cr_df_skip"))
-    kb.add(B("❌ Отмена", callback_data="cr_cancel"))
-    send(cid, txt, kb)
-
-def next_data_field(cid):
-    d = DRAFT.get(str(cid)) or {}
-    show_data_field(cid, d.get("current_df_idx", 0) + 1)
-
-def start_name_input(cid, name):
-    d = DRAFT.get(str(cid)) or {}
-    d["name"] = name; d["step"] = "price"; save_draft()
-    send(cid, "💰 Пришли <b>цену</b> (число):\n\n/cancel — отмена")
-
-def start_price_input(cid, price):
-    d = DRAFT.get(str(cid)) or {}
-    d["price"] = price; d["step"] = "description"; save_draft()
-    send(cid, "📄 Пришли <b>описание</b>:\n\n/cancel — отмена")
-
-def finalize_draft(cid, desc):
-    d = DRAFT.get(str(cid)) or {}
-    d["description"] = desc; save_draft()
-    ok_n, msg_n = guard_text_ai(d.get("name", ""), "названии")
-    ok_d, msg_d = guard_text_ai(desc, "описании")
-    if not ok_n or not ok_d:
-        send(cid, (msg_n or msg_d) + "\n\nПопробуй /start и создай заново")
-        DRAFT.pop(str(cid), None); save_draft(); return
-    send(cid, "⏳ Создаю лот...")
-    def _create():
-        try:
-            cat_id = d["cat_id"]
-            selected_opts = []
-            opt_map = d.get("options_map", {})
-            for k, v in (d.get("options_selected") or {}).items():
-                key = f"{k}={v}"
-                if key in opt_map: selected_opts.append(opt_map[key])
-            df_payload = []
-            for item in (d.get("data_fields_filled") or []):
-                df_payload.append({"id": item["id"], "value": item["value"]})
-            kw = {"game_category_id": cat_id, "name": d["name"], "price": int(d["price"]),
-                  "description": legal_wrap(d["description"]), "options": selected_opts,
-                  "data_fields": df_payload, "attachments": []}
-            if d.get("obt_id"): kw["obtaining_type_id"] = d["obt_id"]
-            try: it = acc.create_item(**kw)
-            except TypeError:
-                kw.pop("obtaining_type_id", None); it = acc.create_item(**kw)
-            iid = str(g(it, "id", default=""))
-            L.info("created item: %s", iid)
-            DRAFT.pop(str(cid), None); save_draft()
-            send(cid, "✅ <b>Лот создан!</b>\n🆔 <code>" + esc(iid) + "</code>")
-            mem_set("last_item", cid, iid)
-            try:
-                sts = acc.get_item_priority_statuses(iid, int(d["price"]))
-                free = None
-                for s in (getattr(sts, "statuses", None) or getattr(sts, "priority_statuses", None) or []):
-                    try:
-                        if int(getattr(s, "price", -1)) == 0: free = s; break
-                    except Exception: pass
-                if free:
-                    acc.publish_item(iid, free.id)
-                    send(cid, "📤 Опубликован (бесплатный статус)")
-                else: send(cid, "⚠️ Бесплатный статус не найден — публикуй вручную")
-            except Exception as e:
-                L.warning("publish: %s", e); send(cid, "⚠️ Публикация: " + esc(str(e)[:150]))
-            try: show_item(cid, iid)
-            except Exception: pass
-        except Exception as e:
-            L.exception("create_item")
-            send(cid, "❌ Ошибка: <code>" + esc(str(e)[:400]) + "</code>")
-    threading.Thread(target=_create, daemon=True).start()
-
-# ═══════════════════ UI ═══════════════════
+# ═══════════════════════════════════════════════════════════════
+# UI
+# ═══════════════════════════════════════════════════════════════
 def main_kb():
     kb = K(row_width=2)
     kb.row(B("🔌 Подключение", callback_data="conn"), B("📨 Чаты", callback_data="chats"))
     kb.row(B("🔔 Уведомления", callback_data="notify"), B("📋 Сделки", callback_data="deals"))
-    kb.row(B("⚡ Автоподнятие", callback_data="bump"), B("📦 Мои лоты", callback_data="items:0"))
-    kb.row(B("➕ Создать лот", callback_data="cr_start"), B("👤 Профиль", callback_data="prof"))
+    kb.row(B("📦 Мои лоты", callback_data="items:0"), B("👤 Профиль", callback_data="prof"))
     kb.row(B("🤖 AI-проверка", callback_data="ai"), B("⚙️ Настройки", callback_data="set"))
-    kb.row(B("🛠 Обновить бота", callback_data="update"), B("🔄 Обновить меню", callback_data="menu"))
+    kb.row(B("🛠 Обновить", callback_data="update"), B("🔄 Меню", callback_data="menu"))
     return kb
 
 def main_text():
@@ -1201,8 +1019,7 @@ def cmd_cancel(m):
 def cb(c):
     try: bot.answer_callback_query(c.id)
     except Exception: pass
-    if not is_authorized(int(c.from_user.id)):
-        return
+    if not is_authorized(int(c.from_user.id)): return
     a = c.data; cid = c.message.chat.id; mid_ = c.message.id
     try:
         L.info("CB: %r", a)
@@ -1240,32 +1057,19 @@ def cb(c):
                     notif("🟢 " + INSTANCE_NAME + " переподключён")
                 except Exception as e:
                     send(cid, "❌ " + esc(str(e)[:250]))
-                    notif("❌ " + esc(str(e)[:200]))
             threading.Thread(target=_r, daemon=True).start()
         elif a in ("chats","chats_load"): show_chats(cid, True)
-        elif a.startswith("c:"):
-            chat_id = a[2:]; mem_set("last_chat", cid, chat_id)
-            show_history(cid, chat_id)
+        elif a.startswith("c:"): show_history(cid, a[2:])
         elif a.startswith("r:"):
-            state[cid] = {"action": "reply", "chat": a[2:]}; bot.send_message(cid, "✍️ Текст:\n\n/cancel")
+            state[cid] = {"action": "reply", "chat": a[2:]}
+            bot.send_message(cid, "✍️ Текст:\n\n/cancel")
         elif a == "deals": show_deals(cid)
         elif a == "notify": show_notify(cid)
         elif a.startswith("tog:"):
             k = a[4:]
             if k in SET_D: SET_D[k] = not SET_D[k]; save_set()
             if k in ("notify_messages","notify_deals","auto_confirm"): show_notify(cid)
-            elif k == "auto_bump": show_bump(cid)
             elif k == "auto_update": show_set(cid)
-        elif a == "bump": show_bump(cid)
-        elif a.startswith("cyc:"):
-            k = a[4:]
-            cyc = {"auto_bump_min": [60,120,240,480,720], "auto_bump_max": [10,50,100,500,1000], "auto_confirm_delay": [10,30,60,120,300]}
-            if k in cyc:
-                try: cur = int(SET_D.get(k, cyc[k][0]))
-                except Exception: cur = cyc[k][0]
-                nxt = cyc[k][(cyc[k].index(cur)+1)%len(cyc[k])] if cur in cyc[k] else cyc[k][0]
-                SET_D[k] = nxt; save_set()
-            show_bump(cid)
         elif a == "prof":
             if acc is None: send(cid, "❌"); return
             refresh_profile(); d = profile or {}
@@ -1301,12 +1105,11 @@ def cb(c):
                 else: send(cid, "✅ Актуальная: <b>" + esc(BOT_VERSION) + "</b>")
             threading.Thread(target=_cu, daemon=True).start()
         elif a == "update":
-            send(cid, "📥 Скачиваю обновление с GitHub...")
+            send(cid, "📥 Скачиваю с GitHub...")
             threading.Thread(target=do_update, args=(cid,), daemon=True).start()
         elif a == "restart":
             send(cid, "🔄"); time.sleep(1); os.execv(sys.executable, [sys.executable] + sys.argv)
         elif a == "log": cmd_log(c)
-        # AI
         elif a == "ai": show_ai(cid)
         elif a == "ai_tog":
             AI_CONFIG["enabled"] = not AI_CONFIG.get("enabled", False); save_ai(); show_ai(cid)
@@ -1326,96 +1129,11 @@ def cb(c):
         elif a == "ai_ping":
             send(cid, "🔗 Тест...")
             threading.Thread(target=ai_ping_task, args=(cid,), daemon=True).start()
-        # МАСТЕР
-        elif a == "cr_start": draft_start(cid)
-        elif a == "cr_cancel":
-            DRAFT.pop(str(cid), None); save_draft()
-            edit(cid, mid_, "❌ Отменено", K().add(B("◀️", callback_data="menu")))
-        elif a == "cr_games_r":
-            cache["games"] = []; cache["games_cursor"] = None
-            show_games(cid, force=True)
-        elif a == "cr_games_all": show_games(cid)
-        elif a == "cr_games_loadall":
-            threading.Thread(target=lambda: show_games(cid, load_all=True), daemon=True).start()
-        elif a.startswith("cr_games_p:"):
-            try: p = int(a.split(":")[1])
-            except Exception: p = 0
-            show_games(cid, page=p)
-        elif a == "cr_search":
-            state[cid] = {"action": "cr_search"}
-            bot.send_message(cid, "🔍 Пришли название игры:\n\n/cancel — отмена")
-        elif a.startswith("cr_searchcat:"):
-            game_id = a.split(":",1)[1]
-            state[cid] = {"action": "cr_searchcat", "game_id": game_id}
-            bot.send_message(cid, "🔍 Пришли название категории:\n\n/cancel — отмена")
-        elif a.startswith("cr_game:"):
-            gid = a[8:]; show_categories(cid, gid)
-        elif a.startswith("cr_cat_back:"):
-            game_id = a.split(":",1)[1]; show_categories(cid, game_id)
-        elif a == "cr_back_games": show_games(cid)
-        elif a.startswith("cr_cat:"):
-            _, rest = a.split(":", 1)
-            parts = rest.split("|", 1)
-            if len(parts) == 2: show_obtaining(cid, parts[0], parts[1])
-        elif a.startswith("cr_obt:"):
-            oid = a[7:]
-            d = DRAFT.get(str(cid)) or {}
-            d["obt_id"] = oid; save_draft()
-            show_options(cid)
-        elif a.startswith("cr_opt_skip:"):
-            d = DRAFT.get(str(cid)) or {}
-            d.setdefault("options_selected", {}); save_draft()
-            next_options_field(cid)
-        elif a.startswith("cr_opt:"):
-            rest = a[7:]
-            if "=" in rest:
-                field, val = rest.split("=", 1)
-                d = DRAFT.get(str(cid)) or {}
-                d.setdefault("options_selected", {})[field] = val
-                save_draft(); next_options_field(cid)
-        elif a == "cr_df_skip":
-            d = DRAFT.get(str(cid)) or {}
-            idx = d.get("current_df_idx", 0)
-            lst = d.get("data_fields_list", [])
-            if idx < len(lst): lst[idx]["value"] = None
-            save_draft(); next_data_field(cid)
-        # ЛОТЫ
         elif a == "items" or a.startswith("items:"):
             try: off = int(a.split(":")[1]) if ":" in a else 0
             except Exception: off = 0
             show_items(cid, off)
-        elif a.startswith("it:"):
-            iid = a[3:]
-            mem_set("last_item", cid, iid)
-            show_item(cid, iid)
-        elif a.startswith("chkstatus:"):
-            iid = a[10:]
-            send(cid, "🔄 Проверяю статус...")
-            def _chk():
-                try:
-                    it = acc.get_item(iid)
-                    st_ru = item_status_ru(it)
-                    st_desc = item_status_desc(it)
-                    st_exp = item_status_exp(it)
-                    msg = "📊 <b>Статус: " + esc(st_ru) + "</b>"
-                    if st_exp: msg += "\n📅 До: " + esc(st_exp)
-                    if st_desc: msg += "\n\n⚠️ <b>Замечание:</b>\n<i>" + esc(st_desc[:800]) + "</i>"
-                    kb = K(row_width=1).add(B("🔁 Открыть лот", callback_data="it:" + iid), B("◀️ Назад", callback_data="items:0"))
-                    send(cid, msg, kb)
-                except Exception as e: send(cid, "❌ " + esc(str(e)[:200]))
-            threading.Thread(target=_chk, daemon=True).start()
-        elif a.startswith("edprice:"):
-            state[cid] = {"action": "edprice", "id": a[8:]}; bot.send_message(cid, "💰 Цена:\n\n/cancel")
-        elif a.startswith("edname:"):
-            state[cid] = {"action": "edname", "id": a[7:]}; bot.send_message(cid, "📝 Название:\n\n/cancel")
-        elif a.startswith("eddesc:"):
-            state[cid] = {"action": "eddesc", "id": a[7:]}; bot.send_message(cid, "📄 Описание:\n\n/cancel")
-        elif a.startswith("edphoto:"):
-            state[cid] = {"action": "edphoto", "id": a[8:]}; bot.send_message(cid, "📷 Фото:\n\n/cancel")
-        elif a.startswith("disc1:"):
-            state[cid] = {"action": "disc1", "id": a[6:]}; bot.send_message(cid, "💸 %:\n\n/cancel")
-        elif a == "disc":
-            state[cid] = {"action": "disc"}; bot.send_message(cid, "💰 % на все:\n\n/cancel")
+        elif a.startswith("it:"): show_item(cid, a[3:])
         else: L.warning("CB unhandled: %r", a)
     except Exception as e:
         L.exception("cb error: %s", e)
@@ -1430,13 +1148,11 @@ def show_chats(cid, refresh=False):
     chats = (cache.get("chats") or [])[:20]
     kb = K(row_width=1); lines = ["💬 <b>Чаты</b>", ""]
     if not chats: lines.append("<i>пусто</i>")
-    last_chat = mem_get("last_chat", cid)
     for ch in chats:
         c = str(g(ch, "id", "chat_id") or "")
-        n = chat_name(c) or sender_name(ch, None) or ucache.get(c, "?")
-        mark = "⭐ " if str(c) == str(last_chat) else ""
+        n = chat_name(c) or extract_msg_sender(ch, None) or sender_name(ch, None) or ucache.get(c, "?")
         lines.append("• <b>" + esc(n) + "</b>")
-        kb.add(B(mark + "💬 " + n[:24], callback_data="c:" + c))
+        kb.add(B("💬 " + n[:24], callback_data="c:" + c))
     kb.row(B("📥 Обновить", callback_data="chats_load"), B("◀️", callback_data="menu"))
     send(cid, "\n".join(lines), kb)
 
@@ -1448,9 +1164,9 @@ def show_history(cid, chat_id):
     for m in msgs:
         if my_msg(m): who = "🟦 Я"
         elif known: who = known
-        else: who = "👤 " + sender_name(None, m)
+        else: who = "👤 " + (extract_msg_sender(None, m) or sender_name(None, m))
         lines.append("<b>" + esc(who) + "</b> <i>" + esc(mts(m)) + "</i>")
-        lines.append(esc(mtext(m)[:400])); lines.append("")
+        lines.append(esc(substitute_templates(mtext(m))[:400])); lines.append("")
     kb = K(row_width=2)
     kb.row(B("📜 Обновить", callback_data="c:" + chat_id), B("✍️ Ответ", callback_data="r:" + chat_id))
     kb.add(B("◀️", callback_data="chats"))
@@ -1462,8 +1178,11 @@ def show_deals(cid):
         send(cid, "📋 <b>Сделок нет</b>", K().add(B("◀️", callback_data="menu"))); return
     lines = ["📋 <b>Сделки</b>", ""]
     for d in deals:
-        em = {"PAID":"💳","CONFIRMED":"✅","CANCELED":"❌"}.get(d.get("status",""), "•")
-        lines.append(em + " <code>" + esc(d.get("id","")[:16]) + "</code> · " + esc(d.get("buyer","—")) + " · " + str(d.get("price",0)) + "₽")
+        st = d.get("status", "")
+        em = status_emoji(st)
+        lines.append(em + " <code>" + esc(d.get("id","")[:16]) + "</code> · "
+                     + esc(d.get("buyer","—")) + " · " + str(d.get("price",0)) + "₽ · "
+                     + esc(status_ru(st)))
     send(cid, "\n".join(lines), K(row_width=1).add(B("◀️", callback_data="menu")))
 
 def show_notify(cid):
@@ -1474,32 +1193,31 @@ def show_notify(cid):
     kb.add(B("◀️", callback_data="menu"))
     send(cid, "🔔 <b>Уведомления</b>", kb)
 
-def show_bump(cid):
-    on = SET_D.get("auto_bump")
-    kb = K(row_width=2)
-    kb.row(B("🔴 Выкл" if on else "🟢 Вкл", callback_data="tog:auto_bump"),
-           B("⏱ " + str(SET_D.get("auto_bump_min",240)) + "м", callback_data="cyc:auto_bump_min"))
-    kb.row(B("💰 " + str(SET_D.get("auto_bump_max",100)) + "₽", callback_data="cyc:auto_bump_max"),
-           B("◀️", callback_data="menu"))
-    send(cid, "⚡ <b>Автоподнятие</b>\nСтатус: <b>" + ("🟢 вкл" if on else "🔴 выкл") + "</b>", kb)
+def show_set(cid):
+    auto = "✅ вкл" if SET_D.get("auto_update", True) else "❌ выкл"
+    lines = ["⚙️ <b>Настройки</b>", "",
+             "🆔 Инстанс: <b>" + esc(INSTANCE_NAME) + "</b>",
+             "📦 Версия: <b>" + esc(BOT_VERSION) + "</b>",
+             "🔄 Автообновление: <b>" + auto + "</b>"]
+    kb = K(row_width=1)
+    kb.add(B("🔄 Автообновление " + auto, callback_data="tog:auto_update"))
+    kb.add(B("◀️", callback_data="menu"))
+    send(cid, "\n".join(lines), kb)
 
 def show_items(cid, off=0):
     if acc is None: send(cid, "❌"); return
     items = get_items()
     kb = K(row_width=1); lines = ["📦 <b>Мои лоты</b>", ""]
     if not items: lines.append("<i>нет лотов</i>")
-    last_item = mem_get("last_item", cid)
     for it in items[off:off+5]:
         iid = str(g(it, "id", "item_id") or "")
         name = sv(g(it, "name", "title"))
         try: price = int(g(it, "price", "amount") or 0)
         except Exception: price = 0
-        st_ru = item_status_ru(it)
         photos = item_photos(it)
-        mark = "⭐ " if str(iid) == str(last_item) else ("🖼" if photos else "·")
-        lines.append(mark + " <b>" + esc(name[:40]) + "</b> — " + str(price) + "₽ · " + esc(st_ru))
-        kb.add(B(mark + "📦 " + name[:20] + " · " + str(price) + "₽", callback_data="it:" + iid))
-    kb.row(B("➕ Создать лот", callback_data="cr_start"), B("💰 Скидка", callback_data="disc"))
+        mark = "🖼" if photos else "·"
+        lines.append(mark + " <b>" + esc(name[:40]) + "</b> — " + str(price) + "₽")
+        kb.add(B("📦 " + name[:20] + " · " + str(price) + "₽", callback_data="it:" + iid))
     kb.add(B("◀️", callback_data="menu"))
     send(cid, "\n".join(lines), kb)
 
@@ -1515,34 +1233,20 @@ def show_item(cid, iid):
     desc = sv(g(it, "description"), "нет описания")
     try: price = int(g(it, "price", "amount") or 0)
     except Exception: price = 0
-    st_ru = item_status_ru(it)
-    st_desc = item_status_desc(it)
-    st_exp = item_status_exp(it)
     photos = item_photos(it)
-    L.info("show_item %s photos=%d status=%s", iid[:12], len(photos), st_ru)
     lines = ["📦 <b>" + esc(name) + "</b>", "",
              "💰 Цена: <b>" + str(price) + "₽</b>",
-             "📊 Статус: <b>" + esc(st_ru) + "</b>"]
-    if st_exp: lines.append("📅 До: " + esc(st_exp))
-    lines.append("🖼 Фото: <b>" + str(len(photos)) + "</b>")
-    if st_desc:
-        lines.append(""); lines.append("⚠️ <b>Замечание модератора:</b>")
-        lines.append("<i>" + esc(st_desc[:600]) + "</i>")
+             "🖼 Фото: <b>" + str(len(photos)) + "</b>"]
     lines.append(""); lines.append("📝 " + esc(desc[:400]))
-    kb = K(row_width=2)
-    kb.row(B("💰 Цена", callback_data="edprice:" + iid), B("📝 Название", callback_data="edname:" + iid))
-    kb.row(B("📄 Описание", callback_data="eddesc:" + iid), B("💸 Скидка", callback_data="disc1:" + iid))
-    kb.row(B("📷 Сменить фото", callback_data="edphoto:" + iid), B("🌐 Открыть", url=item_url(iid, it)))
-    st_name = str(getattr(g(it, "status"), "name", "")).upper()
-    if st_name in ("DECLINED", "BLOCKED", "PENDING_MODERATION", "PENDING_APPROVAL"):
-        kb.row(B("🔄 Проверить статус", callback_data="chkstatus:" + iid))
+    kb = K(row_width=1)
+    kb.add(B("🌐 Открыть", url=item_url(iid, it)))
     kb.add(B("◀️", callback_data="items:0"))
     txt = "\n".join(lines)
     if photos:
         for u in photos[:3]:
             try:
                 bot.send_photo(cid, u, caption=txt[:1024], reply_markup=kb, parse_mode="HTML"); return
-            except Exception as e: L.warning("send_photo fail: %s", e)
+            except Exception: pass
     send(cid, txt, kb)
 
 def show_ai(cid):
@@ -1555,7 +1259,8 @@ def show_ai(cid):
              "Модель: <code>" + esc(c.get("model") or "(по умолчанию)") + "</code>",
              "Ключ: " + ("✅" if has_key else "❌")]
     kb = K(row_width=2)
-    kb.row(B("🔴 Выкл" if on else "🟢 Вкл", callback_data="ai_tog"), B("🔒 Строго" if not c.get("strict") else "🟡 Мягко", callback_data="ai_mode"))
+    kb.row(B("🔴 Выкл" if on else "🟢 Вкл", callback_data="ai_tog"),
+           B("🔒 Строго" if not c.get("strict") else "🟡 Мягко", callback_data="ai_mode"))
     kb.row(B("🔑 Ключ", callback_data="ai_key"), B("🎯 Провайдер", callback_data="ai_prov"))
     kb.row(B("📝 Модель", callback_data="ai_model"), B("🔗 Тест связи", callback_data="ai_ping"))
     kb.row(B("🧪 Тест", callback_data="ai_test"), B("🗑 Сброс", callback_data="ai_clear"))
@@ -1568,7 +1273,7 @@ def show_ai_prov(cid):
         cur = "✅ " if AI_CONFIG.get("provider") == p else ""
         kb.add(B(cur + p, callback_data="ai_setp:" + p))
     kb.add(B("◀️", callback_data="ai"))
-    send(cid, "🎯 Провайдер:\n\ngemini\nopenai\nanthropic\nopenrouter\ndeepseek\ngroq", kb)
+    send(cid, "🎯 Провайдер", kb)
 
 def ai_ping_task(cid):
     if not AI_CONFIG.get("enabled"): send(cid, "❌ выкл"); return
@@ -1584,7 +1289,7 @@ def ai_ping_task(cid):
             return {"model": model, "max_tokens": 20, "messages": [{"role": "user", "content": "Ответь: РАБОТАЕТ"}]}
         txt = ai_call(_b, prov, key, AI_CONFIG.get("model"))
         dt = time.time() - t0
-        if txt: send(cid, "✅ AI отвечает\n\n" + esc(prov) + " · " + esc(model) + "\nОтвет: <i>" + esc(txt[:100]) + "</i>\n" + str(round(dt,1)) + " сек")
+        if txt: send(cid, "✅ AI отвечает\n\n" + esc(prov) + " · " + esc(model) + "\n<i>" + esc(txt[:100]) + "</i>\n" + str(round(dt,1)) + "с")
         else: send(cid, "❌ Пустой")
     except Exception as e: send(cid, "❌ " + esc(str(e)[:250]))
 
@@ -1611,17 +1316,8 @@ def handle_text(m):
                 lst[idx]["value"] = text
                 if "data_fields_filled" not in d: d["data_fields_filled"] = []
                 d["data_fields_filled"].append({"id": lst[idx]["id"], "value": text})
-            save_draft(); next_data_field(m.chat.id); return
-        if step == "name":
-            okv, msg = guard_text_ai(text, "названии")
-            if not okv: bot.reply_to(m, msg); return
-            start_name_input(m.chat.id, text); return
-        if step == "price":
-            try: pp = int(float(text.replace(",", ".")))
-            except Exception: bot.reply_to(m, "❌ Число"); return
-            start_price_input(m.chat.id, pp); return
-        if step == "description":
-            finalize_draft(m.chat.id, text); return
+            save_draft()
+            return
 
     st = state.get(m.chat.id)
     a = st.get("action") if isinstance(st, dict) else st
@@ -1634,7 +1330,9 @@ def handle_text(m):
     elif a == "ddg5":
         state.pop(m.chat.id, None); CREDS["ddg5"] = (m.text or "").strip(); save_creds(); bot.reply_to(m, "✅ ddg5")
     elif a == "ai_key":
-        state.pop(m.chat.id, None); AI_CONFIG["api_key"] = (m.text or "").strip(); AI_CONFIG["enabled"] = True; save_ai(); bot.reply_to(m, "✅ Ключ сохранён")
+        state.pop(m.chat.id, None)
+        AI_CONFIG["api_key"] = (m.text or "").strip(); AI_CONFIG["enabled"] = True
+        save_ai(); bot.reply_to(m, "✅ Ключ сохранён")
     elif a == "ai_model":
         state.pop(m.chat.id, None); AI_CONFIG["model"] = (m.text or "").strip(); save_ai(); bot.reply_to(m, "✅")
     elif a == "ai_test":
@@ -1646,27 +1344,6 @@ def handle_text(m):
             if ok: bot.send_message(m.chat.id, "✅ Нарушений нет")
             else: bot.send_message(m.chat.id, "⚠️ " + esc(r[:500]))
         threading.Thread(target=_t, daemon=True).start()
-    elif a == "cr_search":
-        state.pop(m.chat.id, None)
-        show_games(m.chat.id, query=(m.text or "").strip())
-    elif a == "cr_searchcat":
-        state.pop(m.chat.id, None)
-        game_id = st.get("game_id"); q = (m.text or "").strip().lower()
-        try:
-            try: gm = acc.get_game(slug=game_id)
-            except Exception: gm = acc.get_game(id=game_id)
-        except Exception as e:
-            bot.reply_to(m, "❌ " + esc(str(e)[:150])); return
-        cats = list(getattr(gm, "categories", []) or [])
-        found = [c for c in cats if q in str(g(c, "name", default="")).lower()]
-        if not found: bot.reply_to(m, "❌ Не найдено"); return
-        kb = K(row_width=1)
-        for c in found:
-            cid_ = str(g(c, "id", default=""))
-            nm = sv(g(c, "name"), "?")
-            kb.add(B("📁 " + nm[:40], callback_data="cr_cat:" + str(game_id) + "|" + cid_))
-        kb.add(B("◀️ Назад", callback_data=f"cr_cat_back:{game_id}"))
-        bot.reply_to(m, "🔍 Найдено: " + str(len(found)), reply_markup=kb)
     elif a == "reply":
         state.pop(m.chat.id, None); cid_chat = st.get("chat"); text = (m.text or "").strip()
         if not text: return
@@ -1676,91 +1353,19 @@ def handle_text(m):
         def _rc():
             ok_ai, reason = ai_check_text(text)
             if not ok_ai:
-                bot.send_message(m.chat.id, "⚠️ <b>AI-проверка не пропустила:</b>\n\n" + esc(reason[:500])); return
+                bot.send_message(m.chat.id, "⚠️ <b>AI не пропустил:</b>\n\n" + esc(reason[:500])); return
             try:
                 acc.send_message(chat_id=cid_chat, text=text)
                 bot.send_message(m.chat.id, "✅ Отправлено")
             except Exception as e: bot.send_message(m.chat.id, "❌ " + esc(str(e)[:200]))
         threading.Thread(target=_rc, daemon=True).start()
-    elif a == "edprice":
-        state.pop(m.chat.id, None); iid = st.get("id")
-        try: p = int(float((m.text or "").strip().replace(",", ".")))
-        except Exception: bot.reply_to(m, "❌ Число"); return
-        try:
-            it = acc.get_item(iid)
-            acc.update_item(iid, name=it.name, price=p, description=getattr(it,"description","") or "", options=getattr(it,"options",None) or [], data_fields=getattr(it,"data_fields",None) or [])
-            bot.reply_to(m, "✅ " + str(p) + "₽"); show_item(m.chat.id, iid)
-        except Exception as e: bot.reply_to(m, "❌ " + esc(str(e)[:200]))
-    elif a == "edname":
-        state.pop(m.chat.id, None); iid = st.get("id"); v = (m.text or "").strip()
-        bot.reply_to(m, "🔍 Проверяю...")
-        def _en():
-            okv, msg = guard_text_ai(v, "названии")
-            if not okv:
-                bot.send_message(m.chat.id, msg); return
-            try:
-                it = acc.get_item(iid)
-                acc.update_item(iid, name=v, price=int(it.price), description=getattr(it,"description","") or "", options=getattr(it,"options",None) or [], data_fields=getattr(it,"data_fields",None) or [])
-                bot.send_message(m.chat.id, "✅"); show_item(m.chat.id, iid)
-            except Exception as e: bot.send_message(m.chat.id, "❌ " + esc(str(e)[:200]))
-        threading.Thread(target=_en, daemon=True).start()
-    elif a == "eddesc":
-        state.pop(m.chat.id, None); iid = st.get("id"); v = (m.text or "").strip()
-        bot.reply_to(m, "🔍 Проверяю...")
-        def _ed():
-            okv, msg = guard_text_ai(v, "описании")
-            if not okv:
-                bot.send_message(m.chat.id, msg); return
-            try:
-                it = acc.get_item(iid)
-                acc.update_item(iid, name=it.name, price=int(it.price), description=legal_wrap(v), options=getattr(it,"options",None) or [], data_fields=getattr(it,"data_fields",None) or [])
-                bot.send_message(m.chat.id, "✅"); show_item(m.chat.id, iid)
-            except Exception as e: bot.send_message(m.chat.id, "❌ " + esc(str(e)[:200]))
-        threading.Thread(target=_ed, daemon=True).start()
-    elif a == "disc":
-        state.pop(m.chat.id, None)
-        try: pct = float((m.text or "").strip().replace(",", "."))
-        except Exception: bot.reply_to(m, "❌"); return
-        bot.reply_to(m, "⏳")
-        def _d():
-            ok = err = 0
-            for it in get_items():
-                try:
-                    iid = g(it, "id", "item_id"); full = acc.get_item(iid)
-                    new = int(round(float(full.price) * (1 - pct/100)))
-                    acc.update_item(iid, name=full.name, price=new, description=getattr(full,"description","") or "", options=getattr(full,"options",None) or [], data_fields=getattr(full,"data_fields",None) or [])
-                    ok += 1
-                except Exception: err += 1
-            bot.send_message(m.chat.id, "✅ " + str(ok) + " / ❌ " + str(err))
-        threading.Thread(target=_d, daemon=True).start()
-    elif a == "disc1":
-        state.pop(m.chat.id, None); iid = st.get("id")
-        try: pct = float((m.text or "").strip().replace(",", "."))
-        except Exception: bot.reply_to(m, "❌"); return
-        try:
-            it = acc.get_item(iid); new = int(round(float(it.price) * (1 - pct/100)))
-            acc.update_item(iid, name=it.name, price=new, description=getattr(it,"description","") or "", options=getattr(it,"options",None) or [], data_fields=getattr(it,"data_fields",None) or [])
-            bot.reply_to(m, "✅ " + str(new) + "₽"); show_item(m.chat.id, iid)
-        except Exception as e: bot.reply_to(m, "❌ " + esc(str(e)[:200]))
 
 @bot.message_handler(content_types=["photo"])
 def on_photo(m):
     if not adm(m): return
     st = state.get(m.chat.id)
     a = st.get("action") if isinstance(st, dict) else None
-    if a == "edphoto":
-        state.pop(m.chat.id, None); iid = st.get("id")
-        try:
-            f = bot.get_file(m.photo[-1].file_id); content = bot.download_file(f.file_path)
-        except Exception as e: bot.reply_to(m, "❌ " + esc(str(e))); return
-        okp, pmsg = guard_photo(content, "image/jpeg", "фото лота")
-        if not okp: bot.reply_to(m, pmsg); return
-        try:
-            it = acc.get_item(iid)
-            acc.update_item(iid, name=it.name, price=int(it.price), description=getattr(it,"description","") or "", options=getattr(it,"options",None) or [], data_fields=getattr(it,"data_fields",None) or [], add_attachments=[content])
-            bot.reply_to(m, "✅ Фото обновлено"); show_item(m.chat.id, iid)
-        except Exception as e: bot.reply_to(m, "❌ " + esc(str(e)[:250]))
-    elif a == "ai_test":
+    if a == "ai_test":
         state.pop(m.chat.id, None)
         try:
             f = bot.get_file(m.photo[-1].file_id); content = bot.download_file(f.file_path)
@@ -1775,9 +1380,7 @@ def on_photo(m):
 def main():
     L.info("=== Playerok Bot v" + BOT_VERSION + " · instance: " + INSTANCE_NAME + " ===")
     L.info("Папка: %s", INST_DIR)
-    L.info("config: %s", CONFIG_FILE)
     L.info("TMPDIR: %s", os.environ.get("TMPDIR"))
-    L.info("seen loaded: msgs=%d deals=%d", len(seen_m), len(seen_d))
     if OK and cookie_str():
         try:
             connect()
@@ -1787,26 +1390,22 @@ def main():
         except Exception as e: L.error("startup: %s", e)
     try: notif("🚀 <b>" + INSTANCE_NAME + "</b> v" + BOT_VERSION + " (pid " + str(os.getpid()) + ")")
     except Exception: pass
-
     try:
         bot.delete_webhook(drop_pending_updates=True)
         L.info("delete_webhook OK")
-    except Exception as e:
-        L.warning("delete_webhook: %s", e)
+    except Exception as e: L.warning("delete_webhook: %s", e)
     try:
         bot.set_my_commands([
-            telebot.types.BotCommand("start",   "🏠 Главное меню"),
-            telebot.types.BotCommand("menu",    "🔄 Обновить меню"),
-            telebot.types.BotCommand("id",      "🆔 Мой ID"),
-            telebot.types.BotCommand("cancel",  "❌ Отмена"),
-            telebot.types.BotCommand("restart", "🔄 Перезапуск"),
-            telebot.types.BotCommand("update",  "📥 Обновить бота"),
-            telebot.types.BotCommand("log",     "📄 Лог"),
+            telebot.types.BotCommand("start",  "🏠 Меню"),
+            telebot.types.BotCommand("menu",   "🔄 Обновить меню"),
+            telebot.types.BotCommand("id",     "🆔 Мой ID"),
+            telebot.types.BotCommand("cancel", "❌ Отмена"),
+            telebot.types.BotCommand("restart","🔄 Перезапуск"),
+            telebot.types.BotCommand("update", "📥 Обновить"),
+            telebot.types.BotCommand("log",    "📄 Лог"),
         ])
         L.info("setMyCommands OK")
-    except Exception as e:
-        L.warning("setMyCommands: %s", e)
-
+    except Exception as e: L.warning("setMyCommands: %s", e)
     L.info("telegram polling start")
     try: bot.infinity_polling(timeout=30, long_polling_timeout=30)
     except KeyboardInterrupt:
