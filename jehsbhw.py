@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v11.12 — фикс статусов/enum, UserProfile, ChatMessage-шаблонов."""
+"""KiriillBR Playerok Bot v11.13 — фикс статусов/enum, UserProfile, шаблонов, отзывов, цены, отслеживание смены статуса."""
 import os, sys, tempfile
 
 os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
@@ -19,7 +19,7 @@ from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-BOT_VERSION = "11.12"
+BOT_VERSION = "11.13"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -207,7 +207,7 @@ LAST_MENU_MSG = {}
 def save_draft(): jsave(DRAFT_FILE, DRAFT)
 
 # ═══════════════════════════════════════════════════════════════
-# ФИКС: работа с enum и объектами playerokapi
+# ФИКС: enum, UserProfile, шаблоны, цена
 # ═══════════════════════════════════════════════════════════════
 
 def status_name(raw):
@@ -242,20 +242,6 @@ def status_emoji(raw):
     k = status_name(raw)
     return DEAL_STATUS_EMOJI.get(k, "🛒")
 
-# ChatMessageEvents → русский
-CHAT_EVENT_RU = {
-    "CHAT_STARTED":"💬 Чат открыт",
-    "CHAT_FINISHED":"✅ Чат завершён",
-    "CHAT_CLOSED":"🔒 Чат закрыт",
-    "CHAT_BLOCKED":"🚫 Чат заблокирован",
-    "CHAT_UNBLOCKED":"🔓 Чат разблокирован",
-    "DEAL_CONFIRMED":"✅ Сделка подтверждена",
-    "DEAL_CONFIRMED_AUTOMATICALLY":"✅ Автоподтверждение сделки",
-    "ITEM_PAID":"💰 Лот оплачен",
-    "ITEM_SENT":"📤 Лот отправлен",
-}
-
-# Шаблоны Playerok → человеческий текст
 _TEMPLATE_MAP = {
     "ITEM_PAID":"💰 Оплачено",
     "ITEM_SENT":"📤 Отправлено",
@@ -279,7 +265,6 @@ _TEMPLATE_MAP = {
 }
 
 def substitute_templates(text, buyer="", price=0, did="", status="", extra=None):
-    """Заменяет {{ITEM_PAID}}, {{DEAL_CONFIRMED}} и т.п. на человеческий текст."""
     if not text: return ""
     t = str(text).strip()
     local = dict(_TEMPLATE_MAP)
@@ -303,7 +288,6 @@ def substitute_templates(text, buyer="", price=0, did="", status="", extra=None)
     return t.strip()
 
 def username_of(obj):
-    """Достаёт username из UserProfile / dict / str."""
     if obj is None: return ""
     if isinstance(obj, str):
         s = obj.strip()
@@ -329,7 +313,6 @@ def my_username():
         return ""
 
 def peer_in_chat(chat):
-    """Из chat.users вернуть ник того, кто не я."""
     users = None
     if isinstance(chat, dict): users = chat.get("users")
     else: users = getattr(chat, "users", None)
@@ -345,7 +328,6 @@ def peer_in_chat(chat):
     return ""
 
 def peer_in_message(msg, chat=None):
-    """Автор сообщения: сначала msg.user, потом peer_in_chat."""
     u = None
     if isinstance(msg, dict): u = msg.get("user")
     else: u = getattr(msg, "user", None)
@@ -355,24 +337,37 @@ def peer_in_message(msg, chat=None):
     return ""
 
 def deal_price(d):
-    """Цена сделки: transaction.amount или item.price."""
-    tr = None
-    if isinstance(d, dict): tr = d.get("transaction")
-    else: tr = getattr(d, "transaction", None)
-    if tr:
-        for k in ("amount","price","value"):
-            v = tr.get(k) if isinstance(tr, dict) else getattr(tr, k, None)
-            if v is not None:
-                try: return float(v)
-                except Exception: pass
-    it = None
-    if isinstance(d, dict): it = d.get("item")
-    else: it = getattr(d, "item", None)
-    if it:
-        v = it.get("price") if isinstance(it, dict) else getattr(it, "price", None)
-        if v is not None:
-            try: return float(v)
-            except Exception: pass
+    """Пытается достать цену из многих полей."""
+    if not d: return 0.0
+    def _num(v):
+        if v is None or v == "" or str(v) == "None": return None
+        try: return float(v)
+        except Exception: return None
+    tr = d.get("transaction") if isinstance(d, dict) else getattr(d, "transaction", None)
+    if tr and str(tr) != "None":
+        for k in ("amount","price","value","total","sum","rub","price_rub"):
+            n = _num(tr.get(k) if isinstance(tr, dict) else getattr(tr, k, None))
+            if n is not None: return n
+    for k in ("price","amount","total","sum","cost","price_rub","sum_rub"):
+        n = _num(d.get(k) if isinstance(d, dict) else getattr(d, k, None))
+        if n is not None: return n
+    it = d.get("item") if isinstance(d, dict) else getattr(d, "item", None)
+    if it and str(it) != "None":
+        for k in ("price","amount","cost","total","price_rub","sum"):
+            n = _num(it.get(k) if isinstance(it, dict) else getattr(it, k, None))
+            if n is not None: return n
+    pr = d.get("props") if isinstance(d, dict) else getattr(d, "props", None)
+    if isinstance(pr, dict):
+        for k in ("price","amount","total","sum"):
+            n = _num(pr.get(k))
+            if n is not None: return n
+    logs = d.get("logs") if isinstance(d, dict) else getattr(d, "logs", None)
+    if isinstance(logs, list):
+        for lg in logs:
+            if isinstance(lg, dict):
+                for k in ("price","amount","total"):
+                    n = _num(lg.get(k))
+                    if n is not None: return n
     return 0.0
 
 def deal_item_name(d):
@@ -381,7 +376,7 @@ def deal_item_name(d):
     else: it = getattr(d, "item", None)
     if not it: return ""
     v = it.get("name") if isinstance(it, dict) else getattr(it, "name", None)
-    return str(v).strip() if v else ""
+    return str(v).strip() if v and str(v) != "None" else ""
 
 def deal_review_text(d):
     r = None
@@ -406,6 +401,7 @@ def deal_review_rating(d):
 # Утилиты
 # ═══════════════════════════════════════════════════════════════
 def esc(s): return str(s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
 def sv(v, d="—"):
     if v is None: return d
     s = str(v).strip()
@@ -528,7 +524,6 @@ def mts(m):
     return ""
 
 def my_msg(m, chat=None):
-    """True если сообщение от меня."""
     if m is None: return False
     me = my_username()
     if not me: return False
@@ -551,7 +546,7 @@ def mid(m):
     return ""
 
 # ═══════════════════════════════════════════════════════════════
-# AI (модерация)
+# AI
 # ═══════════════════════════════════════════════════════════════
 AI_DEFAULTS = {
     "openai": ("https://api.openai.com/v1/chat/completions","gpt-4o-mini"),
@@ -699,7 +694,7 @@ def connect():
     raise RuntimeError(" | ".join(errs))
 
 # ═══════════════════════════════════════════════════════════════
-# POLLER
+# POLLER — ловит новые + смену статуса
 # ═══════════════════════════════════════════════════════════════
 def poller():
     global cache
@@ -722,13 +717,19 @@ def poller():
             if now - cache.get("ts", 0) > 60:
                 cache["chats"] = get_chats(); cache["ts"] = now
 
-            # Сделки
             for d in get_deals():
                 did = str(g(d, "id", "deal_id") or "")
-                if did and did not in seen_d:
-                    seen_d.add(did); on_deal(d)
+                if not did: continue
+                new_status = status_name(g(d, "status", "state") or "")
+                old = DEALS_D.get(did, {})
+                old_status = old.get("status", "")
+                if did not in seen_d:
+                    seen_d.add(did)
+                    on_deal(d, first_time=True)
+                elif new_status and new_status != old_status:
+                    L.info("deal %s changed %s -> %s", did[:12], old_status, new_status)
+                    on_deal(d, first_time=False)
 
-            # Сообщения
             new_msgs = 0
             for ch in (cache.get("chats") or [])[:20]:
                 cid = g(ch, "id", "chat_id")
@@ -742,12 +743,6 @@ def poller():
                     nm = peer_in_message(m, ch) or peer or "—"
                     txt_raw = mtext(m)
                     if not txt_raw or txt_raw == "None": continue
-                    # event type
-                    ev = getattr(m, "event", None) if not isinstance(m, dict) else m.get("event")
-                    ev_name = status_name(ev) if ev else ""
-                    if ev_name in ("CHAT_STARTED", "CHAT_FINISHED", "CHAT_CLOSED"):
-                        # служебные — не спамим
-                        pass
                     txt = substitute_templates(txt_raw, buyer=nm)
                     ucache[str(cid)] = nm
                     if SET_D.get("notify_messages", True):
@@ -764,31 +759,33 @@ def poller():
         if stop.wait(15): return
 
 # ═══════════════════════════════════════════════════════════════
-# ON_DEAL — фикс enum, UserProfile, шаблонов, отзывов
+# ON_DEAL
 # ═══════════════════════════════════════════════════════════════
-def on_deal(d):
+def on_deal(d, first_time=True):
     did = str(g(d, "id", "deal_id") or "")
     raw_status = g(d, "status", "state") or ""
     status_key = status_name(raw_status)
 
-    # покупатель
+    old = DEALS_D.get(did, {})
+    old_status = old.get("status", "")
+
     u_obj = d.get("user") if isinstance(d, dict) else getattr(d, "user", None)
     buyer = username_of(u_obj)
     if not buyer:
         ch = d.get("chat") if isinstance(d, dict) else getattr(d, "chat", None)
         if ch: buyer = peer_in_chat(ch)
-    if not buyer or buyer == "None": buyer = "покупатель"
+    if not buyer or buyer == "None": buyer = old.get("buyer") or "покупатель"
 
     price = deal_price(d)
-    item_name = deal_item_name(d)
+    if price == 0.0:
+        price = old.get("price", 0.0)
+
+    item_name = deal_item_name(d) or old.get("item", "")
     review_text = deal_review_text(d)
     review_rating = deal_review_rating(d)
 
-    # сообщение-описание сделки
     raw_msg = g(d, "message", "text", "description") or ""
     msg = substitute_templates(raw_msg, buyer=buyer, price=price, did=did, status=status_key)
-    if not msg:
-        msg = status_ru(status_key)
 
     DEALS_D[did] = {
         "id": did, "status": status_key, "buyer": buyer,
@@ -797,22 +794,27 @@ def on_deal(d):
         "review_text": review_text, "review_rating": review_rating,
     }
     save_deals()
-    L.info("deal %s st=%s buyer=%s price=%s item=%s",
-           did[:12], status_key, buyer, price, item_name[:40])
+    L.info("deal %s st=%s (old=%s) buyer=%s price=%s item=%s",
+           did[:12], status_key, old_status, buyer, price, item_name[:40])
 
-    if SET_D.get("notify_deals", True):
-        em = status_emoji(status_key)
-        lines = [f"{em} <b>Сделка {esc(did[:16])}</b>"]
-        lines.append(f"👤 {esc(buyer)} · {round(price)}₽")
-        if item_name: lines.append(f"📦 {esc(item_name[:60])}")
-        lines.append(f"📊 {esc(status_ru(status_key))}")
-        if msg and msg != status_ru(status_key):
-            lines += ["", f"💬 <i>{esc(msg[:400])}</i>"]
-        if review_rating:
-            stars = "⭐" * review_rating
-            lines += ["", f"🌟 <b>Отзыв {stars}</b>"]
-            if review_text: lines.append(f"<i>{esc(review_text[:400])}</i>")
-        notif("\n".join(lines))
+    if not SET_D.get("notify_deals", True): return
+
+    em = status_emoji(status_key)
+    if not first_time and old_status and old_status != status_key:
+        header = f"🔄 <b>Сделка обновилась</b> · {esc(did[:16])}"
+    else:
+        header = f"{em} <b>Сделка {esc(did[:16])}</b>"
+
+    lines = [header, f"👤 {esc(buyer)} · {round(price)}₽"]
+    if item_name: lines.append(f"📦 {esc(item_name[:60])}")
+    lines.append(f"📊 {esc(status_ru(status_key))}")
+    if msg and msg != status_ru(status_key):
+        lines += ["", f"💬 <i>{esc(msg[:400])}</i>"]
+    if review_rating:
+        stars = "⭐" * review_rating
+        lines += ["", f"🌟 <b>Отзыв {stars}</b>"]
+        if review_text: lines.append(f"<i>{esc(review_text[:400])}</i>")
+    notif("\n".join(lines))
 
 # ═══════════════════════════════════════════════════════════════
 # AUTO-UPDATE
