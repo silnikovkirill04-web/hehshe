@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v11.13 — фикс статусов/enum, UserProfile, шаблонов, отзывов, цены, отслеживание смены статуса."""
+"""KiriillBR Playerok Bot v11.14 — фиксы + система плагинов."""
 import os, sys, tempfile
 
 os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
@@ -14,12 +14,13 @@ try:
 except Exception: pass
 
 import json, logging, re, threading, time, urllib.request, base64, fcntl, atexit
+import importlib.util
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-BOT_VERSION = "11.13"
+BOT_VERSION = "11.14"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -150,7 +151,9 @@ if MAIN_ADMIN and MAIN_ADMIN not in USERS_STATE.get("authorized", []):
     jsave(USERS_FILE, USERS_STATE)
 AI_CONFIG = jload(AI_FILE, {"enabled": False, "provider": "gemini", "api_key": "", "model": "", "strict": True})
 NAMES_D = jload(NAMES_FILE, {})
-PLUGS_D = jload(PLUGINS_FILE, {})
+PLUGS_D = jload(PLUGINS_FILE, {"states": {}, "data": {}})
+PLUGS_D.setdefault("states", {})
+PLUGS_D.setdefault("data", {})
 SEEN_D = jload(SEEN_FILE, {"msgs": [], "deals": []})
 
 def save_creds(): jsave(CREDS_FILE, CREDS)
@@ -207,11 +210,268 @@ LAST_MENU_MSG = {}
 def save_draft(): jsave(DRAFT_FILE, DRAFT)
 
 # ═══════════════════════════════════════════════════════════════
+# ПЛАГИНЫ
+# ═══════════════════════════════════════════════════════════════
+PLUGINS_LOADED = {}
+PLUGIN_STATES = PLUGS_D.setdefault("states", {})
+PLUGIN_DATA = PLUGS_D.setdefault("data", {})
+
+def _plugin_meta(mod):
+    name = getattr(mod, "NAME", None) or getattr(mod, "name", None) or "Плагин"
+    ver = getattr(mod, "VERSION", None) or getattr(mod, "version", None) or "1.0"
+    desc = getattr(mod, "DESCRIPTION", "") or ""
+    menu = getattr(mod, "MENU", None) or getattr(mod, "menu", None)
+    if callable(menu):
+        try: menu = menu() or []
+        except Exception: menu = []
+    if not menu: menu = []
+    out = []
+    for it in menu:
+        if isinstance(it, (list, tuple)) and len(it) >= 2:
+            out.append((str(it[0]), str(it[1])))
+        elif isinstance(it, str):
+            out.append((it, it))
+    return str(name), str(ver), str(desc), out
+
+def _plugin_load_file(path):
+    pid = os.path.splitext(os.path.basename(path))[0]
+    try:
+        spec = importlib.util.spec_from_file_location(f"aip_plugin_{pid}", path)
+        if not spec: return pid, None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return pid, mod
+    except Exception as e:
+        L.error("plugin %s load: %s", pid, e)
+        return pid, None
+
+class PluginCtx:
+    def __init__(self, cid, uid=None):
+        self.cid = cid
+        self.uid = uid or cid
+        self.BOT_VERSION = BOT_VERSION
+    @property
+    def bot(self): return bot
+    @property
+    def acc(self): return acc
+    @property
+    def profile(self): return profile
+    @property
+    def deals(self): return DEALS_D
+    @property
+    def chats(self): return cache.get("chats", [])
+    def send(self, text, kb=None): return send(self.cid, text, kb)
+    def edit(self, mid, text, kb=None): return edit(self.cid, mid, text, kb)
+    def log(self, *a): L.info("[plugin] " + " ".join(str(x) for x in a))
+    def esc(self, s): return esc(s)
+    def save(self, key, val):
+        PLUGIN_DATA[str(key)] = val; save_plugs()
+    def load(self, key, default=None):
+        return PLUGIN_DATA.get(str(key), default)
+
+def load_all_plugins():
+    # выгружаем старые
+    for pid, p in list(PLUGINS_LOADED.items()):
+        mod = p.get("module")
+        if mod and callable(getattr(mod, "on_unload", None)):
+            try: mod.on_unload(PluginCtx(MAIN_ADMIN or 0))
+            except Exception as e: L.warning("plugin %s on_unload: %s", pid, e)
+    PLUGINS_LOADED.clear()
+
+    if not os.path.isdir(PLUGINS_DIR): return
+    for f in sorted(os.listdir(PLUGINS_DIR)):
+        if not f.endswith(".py") or f.startswith("_"): continue
+        path = os.path.join(PLUGINS_DIR, f)
+        pid, mod = _plugin_load_file(path)
+        if not mod: continue
+        try:
+            name, ver, desc, menu = _plugin_meta(mod)
+        except Exception as e:
+            L.warning("plugin %s meta: %s", pid, e); continue
+        state_obj = PLUGIN_STATES.get(pid, {})
+        enabled = bool(state_obj.get("enabled", True))
+        PLUGINS_LOADED[pid] = {
+            "module": mod, "name": name, "version": ver,
+            "description": desc, "menu": menu, "enabled": enabled,
+        }
+        if enabled and callable(getattr(mod, "on_load", None)):
+            try: mod.on_load(PluginCtx(MAIN_ADMIN or 0))
+            except Exception as e: L.warning("plugin %s on_load: %s", pid, e)
+        L.info("plugin %s loaded (name=%s, enabled=%s)", pid, name, enabled)
+
+def show_plugins(cid, mid=None):
+    kb = K(row_width=1)
+    for pid, p in PLUGINS_LOADED.items():
+        emoji = "🟢" if p["enabled"] else "🔴"
+        kb.add(B(f"{emoji} {p['name']}", callback_data=f"pl_open:{pid}"))
+    kb.add(B("➕ Добавить плагин", callback_data="pl_add"))
+    if PLUGINS_LOADED:
+        kb.add(B("🗑 Удалить плагин", callback_data="pl_del_menu"))
+    kb.add(B("📄 Шаблон плагина", callback_data="pl_tpl"))
+    kb.add(B("◀️ Меню", callback_data="menu"))
+    txt = "🧩 <b>Плагины</b>\n\n"
+    if not PLUGINS_LOADED:
+        txt += "<i>Плагинов нет. Нажми ➕, чтобы добавить .py файл.</i>"
+    else:
+        txt += "Нажми на плагин — откроется его меню.\n🟢 включён, 🔴 выключен"
+    if mid:
+        try: bot.edit_message_text(txt, cid, mid, reply_markup=kb); return
+        except Exception: pass
+    send(cid, txt, kb)
+
+def plugin_open(cid, uid, pid, mid=None):
+    p = PLUGINS_LOADED.get(pid)
+    if not p:
+        send(cid, "❌ Плагин не найден"); return
+    kb = K(row_width=1)
+    if p["enabled"]:
+        for label, action in p["menu"]:
+            kb.add(B(label, callback_data=f"pl_run:{pid}:{action}"))
+    toggle = "🔴 Выключить" if p["enabled"] else "🟢 Включить"
+    kb.row(B(toggle, callback_data=f"pl_tog:{pid}"),
+           B("🗑 Удалить", callback_data=f"pl_del:{pid}"))
+    kb.add(B("◀️ Плагины", callback_data="plugins_list"))
+    txt = f"🧩 <b>{esc(p['name'])}</b> v{esc(p['version'])}\n"
+    if p["description"]: txt += f"\n<i>{esc(p['description'])}</i>\n"
+    txt += f"\nСтатус: {'🟢 включён' if p['enabled'] else '🔴 выключен'}"
+    if not p["menu"]:
+        txt += "\n\n<i>Меню плагина пустое</i>"
+    if not p["enabled"]:
+        txt += "\n\n<i>Плагин выключен. Включи, чтобы увидеть меню.</i>"
+    if mid:
+        try: bot.edit_message_text(txt, cid, mid, reply_markup=kb); return
+        except Exception: pass
+    send(cid, txt, kb)
+
+def plugin_toggle(cid, uid, pid, mid=None):
+    p = PLUGINS_LOADED.get(pid)
+    if not p: return
+    p["enabled"] = not p["enabled"]
+    PLUGIN_STATES[pid] = {"enabled": p["enabled"]}
+    save_plugs()
+    mod = p["module"]
+    if p["enabled"] and callable(getattr(mod, "on_load", None)):
+        try: mod.on_load(PluginCtx(cid, uid))
+        except Exception as e: L.warning("on_load: %s", e)
+    if not p["enabled"] and callable(getattr(mod, "on_unload", None)):
+        try: mod.on_unload(PluginCtx(cid, uid))
+        except Exception: pass
+    plugin_open(cid, uid, pid, mid)
+
+def plugin_run_action(cid, uid, pid, action):
+    p = PLUGINS_LOADED.get(pid)
+    if not p: send(cid, "❌ Плагин не найден"); return
+    if not p["enabled"]: send(cid, "🔴 Плагин выключен"); return
+    mod = p["module"]
+    handler = getattr(mod, "handle", None)
+    if not callable(handler):
+        send(cid, "❌ У плагина нет handle()"); return
+    ctx = PluginCtx(cid, uid)
+    try:
+        ok = handler(action, ctx)
+        if not ok: send(cid, f"⚠️ Действие <b>{esc(action)}</b> не обработано")
+    except Exception as e:
+        L.exception("plugin %s:%s", pid, action)
+        send(cid, f"❌ Ошибка плагина: {esc(str(e)[:300])}")
+
+def plugin_del_confirm(cid, pid, mid=None):
+    p = PLUGINS_LOADED.get(pid)
+    if not p: return
+    kb = K(row_width=2)
+    kb.row(B("✅ Да, удалить", callback_data=f"pl_del_yes:{pid}"),
+           B("❌ Отмена", callback_data=f"pl_open:{pid}"))
+    txt = (f"🗑 <b>Удалить плагин?</b>\n\n"
+           f"🧩 <b>{esc(p['name'])}</b> v{esc(p['version'])}\n\n"
+           f"Файл <code>{esc(pid)}.py</code> будет удалён безвозвратно.")
+    if mid:
+        try: bot.edit_message_text(txt, cid, mid, reply_markup=kb); return
+        except Exception: pass
+    send(cid, txt, kb)
+
+def plugin_delete(cid, pid):
+    p = PLUGINS_LOADED.get(pid)
+    if not p:
+        send(cid, "❌ Плагин не найден"); return
+    mod = p["module"]
+    if callable(getattr(mod, "on_unload", None)):
+        try: mod.on_unload(PluginCtx(cid))
+        except Exception: pass
+    path = os.path.join(PLUGINS_DIR, f"{pid}.py")
+    try: os.remove(path)
+    except Exception as e: L.warning("del %s: %s", path, e)
+    PLUGINS_LOADED.pop(pid, None)
+    PLUGIN_STATES.pop(pid, None)
+    save_plugs()
+    send(cid, f"🗑 Плагин <b>{esc(p['name'])}</b> удалён")
+    show_plugins(cid)
+
+PLUGIN_TEMPLATE = '''# Плагин для Playerok Bot
+# Скопируй этот код в файл .py и отправь боту через меню "Плагины"
+
+NAME = "Мой плагин"
+VERSION = "1.0"
+DESCRIPTION = "Описание плагина"
+
+# Меню: список (label, action)
+MENU = [
+    ("👋 Привет", "hello"),
+    ("📊 Данные", "data"),
+]
+
+def on_load(ctx):
+    ctx.log("Плагин загружен")
+
+def on_unload(ctx):
+    ctx.log("Плагин выгружен")
+
+def handle(action, ctx):
+    """Обработчик нажатий на кнопки меню."""
+    if action == "hello":
+        ctx.send("Привет из плагина!")
+        return True
+    if action == "data":
+        # Доступ к данным бота:
+        n_deals = len(ctx.deals)
+        n_chats = len(ctx.chats)
+        username = ctx.profile.get("username", "—") if ctx.profile else "—"
+        ctx.send(
+            f"👤 {ctx.esc(username)}\\n"
+            f"🛒 Сделок: {n_deals}\\n"
+            f"📨 Чатов: {n_chats}"
+        )
+        return True
+    return False
+
+# ctx имеет:
+#   ctx.send(text, kb=None) — отправить сообщение
+#   ctx.edit(mid, text, kb=None) — изменить сообщение
+#   ctx.log(*args) — записать в лог
+#   ctx.esc(s) — экранировать HTML
+#   ctx.save(key, val) / ctx.load(key, default) — сохранение в plugins.json
+#   ctx.bot — объект telebot
+#   ctx.acc — аккаунт Playerok
+#   ctx.deals — {deal_id: {...}}
+#   ctx.chats — список чатов
+#   ctx.profile — {"id", "username", "email"}
+#   ctx.cid, ctx.uid — id чата и юзера
+#   ctx.BOT_VERSION — версия бота
+'''
+
+def plugin_show_template(cid):
+    p = os.path.join(CACHE_DIR := INST_DIR, "plugin_template.py")
+    try:
+        with open(p, "w", encoding="utf-8") as f: f.write(PLUGIN_TEMPLATE)
+        with open(p, "rb") as f:
+            bot.send_document(cid, f, visible_file_name="myplugin.py",
+                caption="📄 Шаблон плагина\n\nОтредактируй и загрузи обратно через «➕ Добавить плагин».")
+    except Exception as e:
+        send(cid, "❌ " + esc(str(e)[:200]))
+
+# ═══════════════════════════════════════════════════════════════
 # ФИКС: enum, UserProfile, шаблоны, цена
 # ═══════════════════════════════════════════════════════════════
 
 def status_name(raw):
-    """ItemDealStatuses.CONFIRMED -> CONFIRMED. Работает для enum и строк."""
     if raw is None: return ""
     name = getattr(raw, "name", None)
     if name: return str(name).upper()
@@ -243,23 +503,13 @@ def status_emoji(raw):
     return DEAL_STATUS_EMOJI.get(k, "🛒")
 
 _TEMPLATE_MAP = {
-    "ITEM_PAID":"💰 Оплачено",
-    "ITEM_SENT":"📤 Отправлено",
-    "ITEM_CONFIRMED":"✅ Подтверждено",
-    "ITEM_CANCELED":"❌ Отменено",
-    "ITEM_REFUNDED":"💸 Возврат",
-    "ITEM_DEAL":"🛒 Сделка",
-    "DEAL_PAID":"💰 Оплачено",
-    "DEAL_SENT":"📤 Отправлено",
-    "DEAL_CONFIRMED":"✅ Сделка подтверждена",
-    "DEAL_CONFIRMED_AUTOMATICALLY":"✅ Автоподтверждение",
-    "DEAL_CANCELED":"❌ Сделка отменена",
-    "DEAL_CANCELLED":"❌ Сделка отменена",
-    "DEAL_REFUNDED":"💸 Возврат по сделке",
-    "DEAL_ROLLED_BACK":"↩️ Возврат средств",
-    "DEAL_CREATED":"🆕 Сделка создана",
-    "DEAL_HAS_PROBLEM":"⚠️ Проблема со сделкой",
-    "DEAL_PROBLEM_RESOLVED":"✅ Проблема решена",
+    "ITEM_PAID":"💰 Оплачено","ITEM_SENT":"📤 Отправлено","ITEM_CONFIRMED":"✅ Подтверждено",
+    "ITEM_CANCELED":"❌ Отменено","ITEM_REFUNDED":"💸 Возврат","ITEM_DEAL":"🛒 Сделка",
+    "DEAL_PAID":"💰 Оплачено","DEAL_SENT":"📤 Отправлено","DEAL_CONFIRMED":"✅ Сделка подтверждена",
+    "DEAL_CONFIRMED_AUTOMATICALLY":"✅ Автоподтверждение","DEAL_CANCELED":"❌ Сделка отменена",
+    "DEAL_CANCELLED":"❌ Сделка отменена","DEAL_REFUNDED":"💸 Возврат по сделке",
+    "DEAL_ROLLED_BACK":"↩️ Возврат средств","DEAL_CREATED":"🆕 Сделка создана",
+    "DEAL_HAS_PROBLEM":"⚠️ Проблема со сделкой","DEAL_PROBLEM_RESOLVED":"✅ Проблема решена",
     "BUYER":"—","BUYER_NAME":"—","USERNAME":"—","SELLER":"—",
     "PRICE":"0","AMOUNT":"0","DEAL_ID":"","ID":"","STATUS":"",
 }
@@ -268,16 +518,12 @@ def substitute_templates(text, buyer="", price=0, did="", status="", extra=None)
     if not text: return ""
     t = str(text).strip()
     local = dict(_TEMPLATE_MAP)
-    local["BUYER"] = buyer or "—"
-    local["BUYER_NAME"] = buyer or "—"
-    local["USERNAME"] = buyer or "—"
+    local["BUYER"] = buyer or "—"; local["BUYER_NAME"] = buyer or "—"; local["USERNAME"] = buyer or "—"
     local["PRICE"] = str(round(price)) if price else "0"
     local["AMOUNT"] = str(round(price)) if price else "0"
-    local["DEAL_ID"] = str(did or "")
-    local["ID"] = str(did or "")
+    local["DEAL_ID"] = str(did or ""); local["ID"] = str(did or "")
     local["STATUS"] = status_ru(status)
     if extra: local.update(extra)
-
     def _r(m):
         k = (m.group(1) or "").strip().upper()
         if k in local: return str(local[k])
@@ -295,22 +541,18 @@ def username_of(obj):
     if isinstance(obj, dict):
         for k in ("username","nickname","name","login","display_name"):
             v = obj.get(k)
-            if isinstance(v, str) and v.strip() and v != "None":
-                return v.strip()
+            if isinstance(v, str) and v.strip() and v != "None": return v.strip()
         return ""
     for k in ("username","nickname","name","login","display_name"):
         try:
             v = getattr(obj, k, None)
-            if isinstance(v, str) and v.strip() and v != "None":
-                return v.strip()
+            if isinstance(v, str) and v.strip() and v != "None": return v.strip()
         except Exception: continue
     return ""
 
 def my_username():
-    try:
-        return str(getattr(acc, "username", "") or "").strip().lower()
-    except Exception:
-        return ""
+    try: return str(getattr(acc, "username", "") or "").strip().lower()
+    except Exception: return ""
 
 def peer_in_chat(chat):
     users = None
@@ -320,8 +562,7 @@ def peer_in_chat(chat):
     me = my_username()
     for u in users:
         un = username_of(u)
-        if un and un.lower() != me:
-            return un
+        if un and un.lower() != me: return un
     for u in users:
         un = username_of(u)
         if un: return un
@@ -337,7 +578,6 @@ def peer_in_message(msg, chat=None):
     return ""
 
 def deal_price(d):
-    """Пытается достать цену из многих полей."""
     if not d: return 0.0
     def _num(v):
         if v is None or v == "" or str(v) == "None": return None
@@ -693,9 +933,6 @@ def connect():
         except Exception as e: errs.append(n + ": " + str(e)[:100])
     raise RuntimeError(" | ".join(errs))
 
-# ═══════════════════════════════════════════════════════════════
-# POLLER — ловит новые + смену статуса
-# ═══════════════════════════════════════════════════════════════
 def poller():
     global cache
     L.info("poller started")
@@ -758,9 +995,6 @@ def poller():
             conn["ok"] = False; conn["err"] = str(e)[:150]; L.exception("poll")
         if stop.wait(15): return
 
-# ═══════════════════════════════════════════════════════════════
-# ON_DEAL
-# ═══════════════════════════════════════════════════════════════
 def on_deal(d, first_time=True):
     did = str(g(d, "id", "deal_id") or "")
     raw_status = g(d, "status", "state") or ""
@@ -777,8 +1011,7 @@ def on_deal(d, first_time=True):
     if not buyer or buyer == "None": buyer = old.get("buyer") or "покупатель"
 
     price = deal_price(d)
-    if price == 0.0:
-        price = old.get("price", 0.0)
+    if price == 0.0: price = old.get("price", 0.0)
 
     item_name = deal_item_name(d) or old.get("item", "")
     review_text = deal_review_text(d)
@@ -883,8 +1116,9 @@ def main_kb():
     kb.row(B("🔌 Подключение", callback_data="conn"), B("📨 Чаты", callback_data="chats"))
     kb.row(B("🔔 Уведомления", callback_data="notify"), B("📋 Сделки", callback_data="deals"))
     kb.row(B("📦 Мои лоты", callback_data="items:0"), B("👤 Профиль", callback_data="prof"))
-    kb.row(B("🤖 AI-проверка", callback_data="ai"), B("⚙️ Настройки", callback_data="set"))
-    kb.row(B("🛠 Обновить", callback_data="update"), B("🔄 Меню", callback_data="menu"))
+    kb.row(B("🤖 AI-проверка", callback_data="ai"), B("🧩 Плагины", callback_data="plugins_list"))
+    kb.row(B("⚙️ Настройки", callback_data="set"), B("🛠 Обновить", callback_data="update"))
+    kb.row(B("🔄 Меню", callback_data="menu"))
     return kb
 
 def main_text():
@@ -897,7 +1131,8 @@ def main_text():
     d = profile or {}
     return (head + "\n👤 <b>" + esc(d.get("username") or "—") + "</b>\n" +
             "🆔 <code>" + esc(d.get("id") or "—") + "</code>\n" +
-            "🛒 Сделок: <b>" + str(len(DEALS_D)) + "</b> · 📨 Чатов: <b>" + str(len(cache.get("chats", []))) + "</b>")
+            "🛒 Сделок: <b>" + str(len(DEALS_D)) + "</b> · 📨 Чатов: <b>" + str(len(cache.get("chats", []))) + "</b>" +
+            " · 🧩 Плагинов: <b>" + str(len(PLUGINS_LOADED)) + "</b>")
 
 @bot.message_handler(commands=["start","menu"])
 def cmd_start(m):
@@ -905,6 +1140,11 @@ def cmd_start(m):
     state.pop(m.chat.id, None)
     DRAFT.pop(str(m.chat.id), None); save_draft()
     _show_main_menu(m.chat.id)
+
+@bot.message_handler(commands=["plugins"])
+def cmd_plugins(m):
+    if not adm(m): return
+    show_plugins(m.chat.id)
 
 @bot.message_handler(commands=["id"])
 def cmd_id(m): bot.reply_to(m, "🆔 <code>" + str(m.chat.id) + "</code>")
@@ -945,6 +1185,7 @@ def cb(c):
     except Exception: pass
     if not is_authorized(int(c.from_user.id)): return
     a = c.data; cid = c.message.chat.id; mid_ = c.message.id
+    uid = c.from_user.id
     try:
         L.info("CB: %r", a)
         if a in ("menu","status","refresh"):
@@ -995,6 +1236,7 @@ def cb(c):
             lines = ["⚙️ <b>Настройки</b>", "",
                      "🆔 Инстанс: <b>" + esc(INSTANCE_NAME) + "</b>",
                      "📦 Версия: <b>" + esc(BOT_VERSION) + "</b>",
+                     "🧩 Плагинов: <b>" + str(len(PLUGINS_LOADED)) + "</b>",
                      "🔄 Автообновление: <b>" + auto + "</b>",
                      "📊 " + upd]
             kb = K(row_width=1)
@@ -1046,6 +1288,40 @@ def cb(c):
             except Exception: off = 0
             show_items(cid, off)
         elif a.startswith("it:"): show_item(cid, a[3:])
+        # ── Плагины ──
+        elif a == "plugins_list": show_plugins(cid, mid_)
+        elif a == "pl_add":
+            state[cid] = {"action": "plugin_add"}
+            bot.send_message(cid,
+                "📎 <b>Добавление плагина</b>\n\n"
+                "Отправь .py файл плагина.\n\n"
+                "Формат: NAME, VERSION, DESCRIPTION, MENU, handle(action, ctx).\n"
+                "Скачай 📄 шаблон в меню плагинов.\n\n/cancel — отмена")
+        elif a == "pl_tpl": plugin_show_template(cid)
+        elif a == "pl_del_menu":
+            kb = K(row_width=1)
+            for pid, p in PLUGINS_LOADED.items():
+                kb.add(B(f"🗑 {p['name']}", callback_data=f"pl_del:{pid}"))
+            kb.add(B("◀️ Плагины", callback_data="plugins_list"))
+            edit(cid, mid_, "🗑 <b>Удаление плагина</b>\n\nВыбери плагин для удаления:",
+                 kb)
+        elif a.startswith("pl_open:"):
+            pid = a[8:]
+            plugin_open(cid, uid, pid, mid_)
+        elif a.startswith("pl_tog:"):
+            pid = a[7:]
+            plugin_toggle(cid, uid, pid, mid_)
+        elif a.startswith("pl_del:"):
+            pid = a[7:]
+            if pid in PLUGINS_LOADED: plugin_del_confirm(cid, pid, mid_)
+        elif a.startswith("pl_del_yes:"):
+            pid = a[11:]
+            plugin_delete(cid, pid)
+        elif a.startswith("pl_run:"):
+            rest = a[7:]
+            if ":" in rest:
+                pid, action = rest.split(":", 1)
+                plugin_run_action(cid, uid, pid, action)
         else: L.warning("CB unhandled: %r", a)
     except Exception as e:
         L.exception("cb error: %s", e)
@@ -1189,6 +1465,46 @@ def ai_ping_task(cid):
         else: send(cid, "❌ Пустой")
     except Exception as e: send(cid, "❌ " + esc(str(e)[:250]))
 
+@bot.message_handler(content_types=["document"])
+def on_document(m):
+    if not adm(m): return
+    st = state.get(m.chat.id)
+    a = st.get("action") if isinstance(st, dict) else None
+    if a != "plugin_add":
+        return
+    doc = m.document
+    fname = (doc.file_name or "").strip()
+    if not fname.lower().endswith(".py"):
+        bot.reply_to(m, "❌ Только .py файлы"); return
+    base = re.sub(r"[^A-Za-z0-9_\-]", "_", os.path.splitext(fname)[0])[:40]
+    if not base:
+        bot.reply_to(m, "❌ Некорректное имя файла"); return
+    if base.startswith("_"):
+        bot.reply_to(m, "❌ Имя не может начинаться с _"); return
+    try:
+        f = bot.get_file(doc.file_id)
+        data = bot.download_file(f.file_path)
+    except Exception as e:
+        bot.reply_to(m, f"❌ {esc(str(e)[:200])}"); return
+    # проверка синтаксиса
+    try:
+        src = data.decode("utf-8")
+    except UnicodeDecodeError:
+        bot.reply_to(m, "❌ Файл не в UTF-8"); return
+    try:
+        compile(src, f"{base}.py", "exec")
+    except SyntaxError as e:
+        bot.reply_to(m, f"❌ Синтаксис: {esc(str(e)[:200])}"); return
+    path = os.path.join(PLUGINS_DIR, f"{base}.py")
+    try:
+        with open(path, "wb") as fh: fh.write(data)
+    except Exception as e:
+        bot.reply_to(m, f"❌ Запись: {esc(str(e)[:200])}"); return
+    state.pop(m.chat.id, None)
+    bot.reply_to(m, f"✅ Файл <b>{esc(base)}.py</b> сохранён. Загружаю...")
+    load_all_plugins()
+    show_plugins(m.chat.id)
+
 @bot.message_handler(content_types=["text"])
 def handle_text(m):
     uid = int(m.chat.id) if m.chat.id else 0
@@ -1218,6 +1534,8 @@ def handle_text(m):
             if ok: bot.send_message(m.chat.id, "✅ Нарушений нет")
             else: bot.send_message(m.chat.id, "⚠️ " + esc(r[:500]))
         threading.Thread(target=_t, daemon=True).start()
+    elif a == "plugin_add":
+        bot.reply_to(m, "📎 Жду .py файл (или /cancel)")
     elif a == "reply":
         state.pop(m.chat.id, None); cid_chat = st.get("chat"); text = (m.text or "").strip()
         if not text: return
@@ -1254,6 +1572,12 @@ def on_photo(m):
 def main():
     L.info("=== Playerok Bot v" + BOT_VERSION + " · instance: " + INSTANCE_NAME + " ===")
     L.info("Папка: %s", INST_DIR)
+    # загрузка плагинов
+    try:
+        load_all_plugins()
+        L.info("Загружено плагинов: %d", len(PLUGINS_LOADED))
+    except Exception as e:
+        L.error("load_all_plugins: %s", e)
     if OK and cookie_str():
         try:
             connect()
@@ -1261,7 +1585,7 @@ def main():
             threading.Thread(target=auto_update_worker, name="upd", daemon=True).start()
             refresh_profile()
         except Exception as e: L.error("startup: %s", e)
-    try: notif("🚀 <b>" + INSTANCE_NAME + "</b> v" + BOT_VERSION + " (pid " + str(os.getpid()) + ")")
+    try: notif("🚀 <b>" + INSTANCE_NAME + "</b> v" + BOT_VERSION + " · 🧩 " + str(len(PLUGINS_LOADED)) + " плагинов")
     except Exception: pass
     try:
         bot.delete_webhook(drop_pending_updates=True)
@@ -1270,6 +1594,7 @@ def main():
         bot.set_my_commands([
             telebot.types.BotCommand("start",  "🏠 Меню"),
             telebot.types.BotCommand("menu",   "🔄 Обновить меню"),
+            telebot.types.BotCommand("plugins","🧩 Плагины"),
             telebot.types.BotCommand("id",     "🆔 Мой ID"),
             telebot.types.BotCommand("cancel", "❌ Отмена"),
             telebot.types.BotCommand("restart","🔄 Перезапуск"),
