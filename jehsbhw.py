@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KiriillBR Playerok Bot v11.19 — фикс фото, автоответы, автоподтверждение для лотов."""
+"""KiriillBR Playerok Bot v11.20 — фото, автоответы, автоподтверждение, автоподнятие."""
 import os, sys, tempfile
 
 os.environ.setdefault("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
@@ -19,7 +19,7 @@ from logging.handlers import RotatingFileHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 
-BOT_VERSION = "11.19"
+BOT_VERSION = "11.20"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
@@ -139,15 +139,16 @@ SET_D = jload(SETTINGS_FILE, {
     "auto_reply_purchase": True,
     "auto_reply_purchase_text": "Спасибо за покупку! Заказ #{deal_id} принят в работу. Если будут вопросы — пиши сюда 🙌",
     "auto_bump": False, "auto_bump_min": 240, "auto_bump_max": 100,
+    "auto_bump_lots": {},
+    "auto_bump_enabled": True,
     "auto_update": False, "tmpl": "Здравствуйте, {buyer}! {message}",
 })
-for k in ("auto_confirm_lots","auto_confirm_reviews","auto_confirm_review_text","auto_reply_purchase","auto_reply_purchase_text"):
-    if k not in SET_D:
-        if k == "auto_confirm_lots": SET_D[k] = []
-        elif k == "auto_confirm_reviews": SET_D[k] = False
-        elif k == "auto_confirm_review_text": SET_D[k] = "Спасибо за отзыв! Рад, что всё прошло хорошо 🙌"
-        elif k == "auto_reply_purchase": SET_D[k] = True
-        elif k == "auto_reply_purchase_text": SET_D[k] = "Спасибо за покупку! Заказ #{deal_id} принят в работу. Если будут вопросы — пиши сюда 🙌"
+for k, v in (("auto_confirm_lots", []), ("auto_confirm_reviews", False),
+             ("auto_confirm_review_text", "Спасибо за отзыв! Рад, что всё прошло хорошо 🙌"),
+             ("auto_reply_purchase", True),
+             ("auto_reply_purchase_text", "Спасибо за покупку! Заказ #{deal_id} принят в работу. Если будут вопросы — пиши сюда 🙌"),
+             ("auto_bump_lots", {}), ("auto_bump_enabled", True)):
+    if k not in SET_D: SET_D[k] = v
 
 DEALS_D = jload(DEALS_FILE, {})
 USERS_STATE = jload(USERS_FILE, {"authorized": []})
@@ -213,7 +214,7 @@ LAST_MENU_MSG = {}
 def save_draft(): jsave(DRAFT_FILE, DRAFT)
 
 # ═══════════════════════════════════════════════════════════════
-# ФИКС: обработка статусов, шаблонов, ников
+# СТАТУСЫ / ШАБЛОНЫ / НИКИ
 # ═══════════════════════════════════════════════════════════════
 def status_name(raw):
     if raw is None: return ""
@@ -226,36 +227,29 @@ def status_name(raw):
     return s.strip().upper()
 
 DEAL_STATUS_RU = {
-    "PAID":"💰 Оплачено, ждём выдачу",
-    "SENT":"📤 Товар отправлен",
-    "CONFIRMED":"✅ Сделка подтверждена",
-    "CONFIRMED_AUTOMATICALLY":"✅ Автоподтверждение",
-    "PENDING":"⏳ Ожидание оплаты",
-    "ROLLED_BACK":"↩️ Возврат средств",
+    "PAID":"💰 Оплачено, ждём выдачу","SENT":"📤 Товар отправлен",
+    "CONFIRMED":"✅ Сделка подтверждена","CONFIRMED_AUTOMATICALLY":"✅ Автоподтверждение",
+    "PENDING":"⏳ Ожидание оплаты","ROLLED_BACK":"↩️ Возврат средств",
 }
-DEAL_STATUS_EMOJI = {
-    "PAID":"💳","SENT":"📤","CONFIRMED":"✅","CONFIRMED_AUTOMATICALLY":"✅",
-    "PENDING":"⏳","ROLLED_BACK":"↩️",
-}
+DEAL_STATUS_EMOJI = {"PAID":"💳","SENT":"📤","CONFIRMED":"✅","CONFIRMED_AUTOMATICALLY":"✅","PENDING":"⏳","ROLLED_BACK":"↩️"}
 
 def status_ru(raw):
     k = status_name(raw)
     return DEAL_STATUS_RU.get(k, k or "—")
-
 def status_emoji(raw):
     k = status_name(raw)
     return DEAL_STATUS_EMOJI.get(k, "🛒")
 
 _TEMPLATE_MAP = {
-    "ITEM_PAID":"💰 Оплачено", "ITEM_SENT":"📤 Отправлено", "ITEM_CONFIRMED":"✅ Подтверждено",
-    "ITEM_CANCELED":"❌ Отменено", "ITEM_REFUNDED":"💸 Возврат", "ITEM_DEAL":"🛒 Сделка",
-    "DEAL_PAID":"💰 Оплачено", "DEAL_SENT":"📤 Отправлено", "DEAL_CONFIRMED":"✅ Сделка подтверждена",
-    "DEAL_CONFIRMED_AUTOMATICALLY":"✅ Автоподтверждение", "DEAL_CANCELED":"❌ Сделка отменена",
-    "DEAL_CANCELLED":"❌ Сделка отменена", "DEAL_REFUNDED":"💸 Возврат по сделке",
-    "DEAL_ROLLED_BACK":"↩️ Возврат средств", "DEAL_CREATED":"🆕 Сделка создана",
-    "DEAL_HAS_PROBLEM":"⚠️ Проблема со сделкой", "DEAL_PROBLEM_RESOLVED":"✅ Проблема решена",
-    "BUYER":"—","BUYER_NAME":"—","USERNAME":"—","SELLER":"—",
-    "PRICE":"0","AMOUNT":"0","DEAL_ID":"","ID":"","STATUS":"",
+    "ITEM_PAID":"💰 Оплачено","ITEM_SENT":"📤 Отправлено","ITEM_CONFIRMED":"✅ Подтверждено",
+    "ITEM_CANCELED":"❌ Отменено","ITEM_REFUNDED":"💸 Возврат","ITEM_DEAL":"🛒 Сделка",
+    "DEAL_PAID":"💰 Оплачено","DEAL_SENT":"📤 Отправлено","DEAL_CONFIRMED":"✅ Сделка подтверждена",
+    "DEAL_CONFIRMED_AUTOMATICALLY":"✅ Автоподтверждение","DEAL_CANCELED":"❌ Сделка отменена",
+    "DEAL_CANCELLED":"❌ Сделка отменена","DEAL_REFUNDED":"💸 Возврат по сделке",
+    "DEAL_ROLLED_BACK":"↩️ Возврат средств","DEAL_CREATED":"🆕 Сделка создана",
+    "DEAL_HAS_PROBLEM":"⚠️ Проблема со сделкой","DEAL_PROBLEM_RESOLVED":"✅ Проблема решена",
+    "BUYER":"—","BUYER_NAME":"—","USERNAME":"—","SELLER":"—","PRICE":"0","AMOUNT":"0",
+    "DEAL_ID":"","ID":"","STATUS":"",
 }
 
 def substitute_templates(text, buyer="", price=0, did="", status="", extra=None):
@@ -271,8 +265,7 @@ def substitute_templates(text, buyer="", price=0, did="", status="", extra=None)
     def _r(m):
         k = (m.group(1) or "").strip().upper()
         if k in local: return str(local[k])
-        k2 = k.rsplit(".", 1)[-1]
-        return str(local.get(k2, ""))
+        return str(local.get(k.rsplit(".", 1)[-1], ""))
     t = re.sub(r"\{\{\s*([A-Za-z0-9_.]+)\s*\}\}", _r, t)
     t = re.sub(r"\{\{[^}]{0,80}\}\}", "", t)
     return t.strip()
@@ -299,9 +292,7 @@ def my_username():
     except Exception: return ""
 
 def peer_in_chat(chat):
-    users = None
-    if isinstance(chat, dict): users = chat.get("users")
-    else: users = getattr(chat, "users", None)
+    users = chat.get("users") if isinstance(chat, dict) else getattr(chat, "users", None)
     if not users: return ""
     me = my_username()
     for u in users:
@@ -313,9 +304,7 @@ def peer_in_chat(chat):
     return ""
 
 def peer_in_message(msg, chat=None):
-    u = None
-    if isinstance(msg, dict): u = msg.get("user")
-    else: u = getattr(msg, "user", None)
+    u = msg.get("user") if isinstance(msg, dict) else getattr(msg, "user", None)
     un = username_of(u)
     if un: return un
     if chat: return peer_in_chat(chat)
@@ -343,17 +332,13 @@ def deal_price(d):
     return 0.0
 
 def deal_item_name(d):
-    it = None
-    if isinstance(d, dict): it = d.get("item")
-    else: it = getattr(d, "item", None)
+    it = d.get("item") if isinstance(d, dict) else getattr(d, "item", None)
     if not it: return ""
     v = it.get("name") if isinstance(it, dict) else getattr(it, "name", None)
     return str(v).strip() if v and str(v) != "None" else ""
 
 def deal_review_text(d):
-    r = None
-    if isinstance(d, dict): r = d.get("review")
-    else: r = getattr(d, "review", None)
+    r = d.get("review") if isinstance(d, dict) else getattr(d, "review", None)
     if not r or str(r) == "None": return ""
     for k in ("text","comment","content"):
         v = r.get(k) if isinstance(r, dict) else getattr(r, k, None)
@@ -361,16 +346,14 @@ def deal_review_text(d):
     return ""
 
 def deal_review_rating(d):
-    r = None
-    if isinstance(d, dict): r = d.get("review")
-    else: r = getattr(d, "review", None)
+    r = d.get("review") if isinstance(d, dict) else getattr(d, "review", None)
     if not r or str(r) == "None": return 0
     v = r.get("rating") if isinstance(r, dict) else getattr(r, "rating", None)
     try: return int(v) if v is not None else 0
     except Exception: return 0
 
 # ═══════════════════════════════════════════════════════════════
-# ФУНКЦИИ АВТО-ДЕЙСТВИЙ
+# АВТО-ДЕЙСТВИЯ
 # ═══════════════════════════════════════════════════════════════
 def _auto_confirm_deal(deal_id):
     delay = int(SET_D.get("auto_confirm_delay", 30) or 30)
@@ -406,7 +389,6 @@ def _auto_reply_to_review(deal_id, review_id, rating, buyer=""):
         notif(f"💬 <b>Автоответ на отзыв</b>\n🧾 #{esc(str(deal_id)[:16])}\n👤 {esc(buyer or '—')}\n{'⭐' * int(rating or 0)}\n\n<i>{esc(text[:200])}</i>")
     except Exception as e:
         L.error("auto_review: ❌ %s", e)
-        notif(f"⚠️ Автоответ на отзыв не удался\n#{esc(str(deal_id)[:16])}\n<i>{esc(str(e)[:200])}</i>")
 
 def _auto_reply_purchase(deal_id, buyer, price, item_name):
     if not SET_D.get("auto_reply_purchase"): return
@@ -422,9 +404,7 @@ def _auto_reply_purchase(deal_id, buyer, price, item_name):
             if deal: chat_id = g(deal, "chat_id", "chat")
         except Exception: pass
         if not chat_id:
-            L.warning("auto_purchase: не нашёл chat_id для %s", deal_id)
-            notif(f"⚠️ Автоответ на покупку: нет chat_id для #{esc(str(deal_id)[:16])}")
-            return
+            L.warning("auto_purchase: не нашёл chat_id для %s", deal_id); return
         if hasattr(acc, "send_message"): acc.send_message(chat_id=chat_id, text=text)
         else:
             q = """mutation SendMessage($chatId: ID!, $text: String!) { sendMessage(chatId: $chatId, text: $text) { id } }"""
@@ -434,7 +414,6 @@ def _auto_reply_purchase(deal_id, buyer, price, item_name):
         notif(f"✉️ <b>Автоответ на покупку</b>\n🧾 #{esc(str(deal_id)[:16])}\n👤 {esc(buyer or '—')}\n📦 {esc(str(item_name or '—')[:60])}")
     except Exception as e:
         L.error("auto_purchase: ❌ %s", e)
-        notif(f"⚠️ Автоответ на покупку не удался\n#{esc(str(deal_id)[:16])}\n<i>{esc(str(e)[:200])}</i>")
 
 def _should_auto_confirm(lot_name):
     if not SET_D.get("auto_confirm"): return False
@@ -451,12 +430,10 @@ def _should_auto_confirm(lot_name):
 # УТИЛИТЫ
 # ═══════════════════════════════════════════════════════════════
 def esc(s): return str(s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-
 def sv(v, d="—"):
     if v is None: return d
     s = str(v).strip()
     return s if s and s != "None" else d
-
 def g(o, *attrs, default=None):
     for a in attrs:
         try:
@@ -464,22 +441,17 @@ def g(o, *attrs, default=None):
             if v is not None and v != "" and str(v) != "None": return v
         except Exception: continue
     return default
-
 def is_authorized(uid):
     if uid == MAIN_ADMIN: return True
     return uid in USERS_STATE.get("authorized", [])
-
 def adm(m):
     try: return is_authorized(int(m.chat.id))
     except Exception: return False
-
 def send(cid, text, kb=None):
     try: bot.send_message(cid, text, reply_markup=kb, disable_web_page_preview=True)
     except Exception as e: L.debug("send: %s", e)
-
 def notif(text, kb=None):
     if MAIN_ADMIN: send(MAIN_ADMIN, text, kb)
-
 def edit(cid, mid, text, kb=None):
     try:
         bot.edit_message_text(text, cid, mid, reply_markup=kb, disable_web_page_preview=True)
@@ -495,7 +467,6 @@ def edit(cid, mid, text, kb=None):
         except Exception as e2:
             L.debug("edit+send fail: %s / %s", e, e2)
             return False
-
 def _show_main_menu(cid, edit_mid=None):
     state.pop(cid, None)
     old = LAST_MENU_MSG.pop(cid, None)
@@ -506,16 +477,13 @@ def _show_main_menu(cid, edit_mid=None):
         if edit(cid, edit_mid, main_text(), main_kb()):
             LAST_MENU_MSG[cid] = edit_mid; return
     try:
-        msg = bot.send_message(cid, main_text(), reply_markup=main_kb(),
-                               disable_web_page_preview=True)
+        msg = bot.send_message(cid, main_text(), reply_markup=main_kb(), disable_web_page_preview=True)
         LAST_MENU_MSG[cid] = msg.message_id
     except Exception as e:
         L.debug("_show_main_menu send: %s", e)
-
 def cookies(): return (CREDS.get("cookies") or "").strip()
 def token_pk(): return (CREDS.get("token") or "").strip()
 def ddg5(): return (CREDS.get("ddg5") or "").strip()
-
 def cookie_str():
     p = []
     if token_pk(): p.append("token=" + token_pk())
@@ -526,7 +494,7 @@ def cookie_str():
     return ";".join(p)
 
 # ═══════════════════════════════════════════════════════════════
-# ФИКС: ФОТО ЛОТОВ
+# ФОТО ЛОТОВ
 # ═══════════════════════════════════════════════════════════════
 def item_photos(it):
     out, seen = [], set()
@@ -567,7 +535,7 @@ def item_photos(it):
             kl = str(k).lower()
             if any(t in kl for t in ("attach","image","photo","banner","pic","cover","media","gallery")): add(v)
     except Exception: pass
-    for attr in ("raw", "json", "json_data", "_raw"):
+    for attr in ("raw","json","json_data","_raw"):
         try:
             rv = getattr(it, attr, None) or (it.get(attr) if isinstance(it, dict) else None)
             if rv: add(rv)
@@ -587,7 +555,7 @@ def item_url(iid, it=None):
     return "https://playerok.com/"
 
 # ═══════════════════════════════════════════════════════════════
-# ФУНКЦИИ API
+# API
 # ═══════════════════════════════════════════════════════════════
 def get_chats():
     if acc is None: return []
@@ -595,62 +563,52 @@ def get_chats():
         r = acc.get_chats()
         return list(getattr(r, "chats", None) or (r if isinstance(r, (list, tuple)) else []))
     except Exception: return []
-
 def get_msgs(cid, n=24):
     if acc is None: return []
     try:
         r = acc.get_chat_messages(cid, count=n)
         return list(getattr(r, "messages", None) or (r if isinstance(r, (list, tuple)) else []))
     except Exception: return []
-
 def get_deals():
     if acc is None: return []
     try:
         r = acc.get_deals()
         return list(getattr(r, "deals", None) or (r if isinstance(r, (list, tuple)) else []))
     except Exception: return []
-
 def get_items():
     if acc is None: return []
     try:
         r = acc.get_my_items()
         return list(getattr(r, "items", None) or (r if isinstance(r, (list, tuple)) else []))
     except Exception: return []
-
 def refresh_profile():
     global profile
     if acc is None: return
     try:
         profile = {"id": sv(g(acc, "id")), "username": sv(g(acc, "username")), "email": sv(g(acc, "email"))}
     except Exception: pass
-
 def mtext(m):
     if m is None: return ""
     for f in ("text","content","body"):
         v = g(m, f)
         if v and str(v) != "None": return str(v)
     return ""
-
 def mts(m):
     for f in ("created_at","timestamp","date","time"):
         v = g(m, f)
         if v and str(v) != "None": return str(v)
     return ""
-
 def my_msg(m, chat=None):
     if m is None: return False
     me = my_username()
     if not me: return False
-    u = None
-    if isinstance(m, dict): u = m.get("user")
-    else: u = getattr(m, "user", None)
+    u = m.get("user") if isinstance(m, dict) else getattr(m, "user", None)
     un = username_of(u).lower()
     if un and un == me: return True
     for f in ("is_my","own","from_me","outgoing"):
         v = getattr(m, f, None) if not isinstance(m, dict) else m.get(f)
         if v is True: return True
     return False
-
 def mid(m):
     for f in ("id","message_id","msg_id","uid"):
         v = g(m, f)
@@ -660,7 +618,7 @@ def mid(m):
     return ""
 
 # ═══════════════════════════════════════════════════════════════
-# AI (заглушка для совместимости)
+# AI-ЗАГЛУШКИ
 # ═══════════════════════════════════════════════════════════════
 AI_DEFAULTS = {"openai": ("https://api.openai.com/v1/chat/completions","gpt-4o-mini"), "gemini": ("https://generativelanguage.googleapis.com/v1beta/models/","gemini-2.0-flash")}
 def ai_call(*a, **kw): raise RuntimeError("AI не настроен")
@@ -703,6 +661,86 @@ def connect():
     raise RuntimeError(" | ".join(errs))
 
 # ═══════════════════════════════════════════════════════════════
+# АВТОПОДНЯТИЕ
+# ═══════════════════════════════════════════════════════════════
+BUMP_STOP = threading.Event()
+BUMP_THREAD = None
+
+def parse_interval(text):
+    if not text: return None
+    t = str(text).lower().strip().replace(" ", "")
+    m = re.match(r"^(\d+)([мmчhдd]|мин|час|дн|день|дня|дней|minutes?|hours?|days?)?$", t)
+    if not m: return None
+    n = int(m.group(1)); unit = (m.group(2) or "").lower()
+    if unit in ("м","m","мин","min","minute","minutes"): return n * 60
+    if unit in ("ч","h","час","hour","hours"): return n * 3600
+    if unit in ("д","d","дн","день","дня","дней","day","days"): return n * 86400
+    return n * 60
+
+def fmt_interval(sec):
+    sec = int(sec)
+    if sec < 60: return f"{sec}с"
+    if sec < 3600 and sec % 60 == 0: return f"{sec//60}мин"
+    if sec < 86400 and sec % 3600 == 0: return f"{sec//3600}ч"
+    if sec % 86400 == 0: return f"{sec//86400}д"
+    if sec < 3600: return f"{sec//60}м{sec%60}с"
+    if sec < 86400: return f"{sec//3600}ч{(sec%3600)//60}м"
+    return f"{sec//86400}д{(sec%86400)//3600}ч"
+
+def bump_lot_now(item_id, silent=False):
+    if acc is None: return False, "нет аккаунта"
+    try:
+        if hasattr(acc, "increase_item_priority_status"):
+            acc.increase_item_priority_status(item_id)
+        else:
+            raise RuntimeError("нет метода increase_item_priority_status")
+        L.info("bump: ✅ %s", item_id)
+        if not silent:
+            notif(f"⚡ <b>Лот поднят</b>\n🆔 <code>{esc(str(item_id)[:16])}</code>")
+        return True, None
+    except Exception as e:
+        L.error("bump %s: %s", item_id, e)
+        if not silent:
+            notif(f"⚠️ <b>Не удалось поднять лот</b>\n🆔 <code>{esc(str(item_id)[:16])}</code>\n<i>{esc(str(e)[:200])}</i>")
+        return False, str(e)[:200]
+
+def bump_worker():
+    L.info("bump worker started")
+    while not BUMP_STOP.is_set():
+        try:
+            if not SET_D.get("auto_bump_enabled", True):
+                if BUMP_STOP.wait(30): return
+                continue
+            lots = SET_D.get("auto_bump_lots", {}) or {}
+            if lots:
+                now = time.time(); changed = False
+                for iid, cfg in list(lots.items()):
+                    if not cfg.get("enabled"): continue
+                    if float(cfg.get("next_at") or 0) <= now:
+                        ok, err = bump_lot_now(iid, silent=False)
+                        cfg["last_at"] = int(now)
+                        cfg["count"] = int(cfg.get("count", 0)) + 1
+                        interval = int(cfg.get("interval_sec") or 3600)
+                        if ok:
+                            cfg["next_at"] = int(now + interval); cfg["last_error"] = None
+                        else:
+                            cfg["next_at"] = int(now + 300); cfg["last_error"] = err
+                        lots[iid] = cfg; changed = True
+                if changed:
+                    SET_D["auto_bump_lots"] = lots; save_set()
+        except Exception as e:
+            L.exception("bump_worker: %s", e)
+        if BUMP_STOP.wait(30): return
+
+def start_bump_worker():
+    global BUMP_THREAD
+    if BUMP_THREAD and BUMP_THREAD.is_alive(): return
+    BUMP_STOP.clear()
+    BUMP_THREAD = threading.Thread(target=bump_worker, daemon=True, name="bump")
+    BUMP_THREAD.start()
+    L.info("bump worker thread started")
+
+# ═══════════════════════════════════════════════════════════════
 # POLLER
 # ═══════════════════════════════════════════════════════════════
 def poller():
@@ -725,20 +763,16 @@ def poller():
             now = time.time()
             if now - cache.get("ts", 0) > 60:
                 cache["chats"] = get_chats(); cache["ts"] = now
-
             for d in get_deals():
                 did = str(g(d, "id", "deal_id") or "")
                 if not did: continue
                 new_status = status_name(g(d, "status", "state") or "")
                 old = DEALS_D.get(did, {})
-                old_status = old.get("status", "")
                 if did not in seen_d:
-                    seen_d.add(did)
-                    on_deal(d, first_time=True)
-                elif new_status and new_status != old_status:
-                    L.info("deal %s changed %s -> %s", did[:12], old_status, new_status)
+                    seen_d.add(did); on_deal(d, first_time=True)
+                elif new_status and new_status != old.get("status", ""):
+                    L.info("deal %s changed %s -> %s", did[:12], old.get("status", ""), new_status)
                     on_deal(d, first_time=False)
-
             new_msgs = 0
             for ch in (cache.get("chats") or [])[:20]:
                 cid = g(ch, "id", "chat_id")
@@ -755,9 +789,7 @@ def poller():
                     txt = substitute_templates(txt_raw, buyer=nm)
                     ucache[str(cid)] = nm
                     if SET_D.get("notify_messages", True):
-                        kb = K(row_width=2).row(
-                            B("📜 15", callback_data="c:" + str(cid)),
-                            B("✍️ Ответ", callback_data="r:" + str(cid)))
+                        kb = K(row_width=2).row(B("📜 15", callback_data="c:" + str(cid)), B("✍️ Ответ", callback_data="r:" + str(cid)))
                         notif("💬 <b>" + esc(nm) + "</b>\n" + esc(txt[:400]), kb)
             if new_msgs: save_seen()
             try: refresh_profile()
@@ -768,13 +800,11 @@ def poller():
         if stop.wait(15): return
 
 # ═══════════════════════════════════════════════════════════════
-# ON_DEAL (с авто-действиями)
+# ON_DEAL
 # ═══════════════════════════════════════════════════════════════
 def on_deal(d, first_time=True):
     did = str(g(d, "id", "deal_id") or "")
-    raw_status = g(d, "status", "state") or ""
-    status_key = status_name(raw_status)
-
+    status_key = status_name(g(d, "status", "state") or "")
     old = DEALS_D.get(did, {})
     old_status = old.get("status", "")
 
@@ -784,24 +814,18 @@ def on_deal(d, first_time=True):
         ch = d.get("chat") if isinstance(d, dict) else getattr(d, "chat", None)
         if ch: buyer = peer_in_chat(ch)
     if not buyer or buyer == "None": buyer = old.get("buyer") or "покупатель"
-
-    price = deal_price(d)
-    if price == 0.0: price = old.get("price", 0.0)
-
+    price = deal_price(d) or old.get("price", 0.0)
     item_name = deal_item_name(d) or old.get("item", "")
     review_text = deal_review_text(d)
     review_rating = deal_review_rating(d)
-
     raw_msg = g(d, "message", "text", "description") or ""
     msg = substitute_templates(raw_msg, buyer=buyer, price=price, did=did, status=status_key)
 
-    DEALS_D[did] = {
-        "id": did, "status": status_key, "buyer": buyer,
-        "price": price, "item": item_name, "message": msg,
-        "review_text": review_text, "review_rating": review_rating,
-    }
+    DEALS_D[did] = {"id": did, "status": status_key, "buyer": buyer, "price": price,
+                    "item": item_name, "message": msg, "review_text": review_text,
+                    "review_rating": review_rating}
     save_deals()
-    L.info("deal %s st=%s (old=%s) buyer=%s price=%s item=%s", did[:12], status_key, old_status, buyer, price, item_name[:40])
+    L.info("deal %s st=%s buyer=%s price=%s", did[:12], status_key, buyer, price)
 
     if SET_D.get("notify_deals", True):
         em = status_emoji(status_key)
@@ -821,8 +845,6 @@ def on_deal(d, first_time=True):
     if status_key == "PAID" and first_time:
         if SET_D.get("auto_reply_purchase", True):
             threading.Thread(target=_auto_reply_purchase, args=(did, buyer, price, item_name), daemon=True).start()
-
-    if status_key == "PAID" and SET_D.get("auto_confirm"):
         if _should_auto_confirm(item_name or msg or ""):
             threading.Thread(target=_auto_confirm_deal, args=(did,), daemon=True).start()
 
@@ -842,9 +864,9 @@ def main_kb():
     kb = K(row_width=2)
     kb.row(B("🔌 Подключение", callback_data="conn"), B("📨 Чаты", callback_data="chats"))
     kb.row(B("🔔 Уведомления", callback_data="notify"), B("📋 Сделки", callback_data="deals"))
-    kb.row(B("📦 Мои лоты", callback_data="items:0"), B("👤 Профиль", callback_data="prof"))
-    kb.row(B("⚙️ Настройки", callback_data="set"), B("🛠 Обновить", callback_data="update"))
-    kb.row(B("🔄 Меню", callback_data="menu"))
+    kb.row(B("📦 Мои лоты", callback_data="items:0"), B("⚡ Автоподнятие", callback_data="bump_all"))
+    kb.row(B("👤 Профиль", callback_data="prof"), B("⚙️ Настройки", callback_data="set"))
+    kb.row(B("🛠 Обновить", callback_data="update"), B("🔄 Меню", callback_data="menu"))
     return kb
 
 def main_text():
@@ -858,6 +880,72 @@ def main_text():
     return (head + "\n👤 <b>" + esc(d.get("username") or "—") + "</b>\n" +
             "🆔 <code>" + esc(d.get("id") or "—") + "</code>\n" +
             "🛒 Сделок: <b>" + str(len(DEALS_D)) + "</b> · 📨 Чатов: <b>" + str(len(cache.get("chats", []))) + "</b>")
+
+def show_conn(cid):
+    lines = ["🔌 <b>Подключение</b>", "",
+             "🍪 cookies: <b>" + str(len(cookies())) + "</b>",
+             "🎫 token: <b>" + str(len(token_pk())) + "</b>",
+             "🛡 ddg5: <b>" + str(len(ddg5())) + "</b>",
+             "🌐 прокси: " + ("✅ " + PROXY if PROXY else "❌ нет"), ""]
+    if acc is not None:
+        refresh_profile()
+        lines.append("✅ Подключён: <b>" + esc(sv(g(acc, "username"))) + "</b>")
+    else: lines.append("❌ Не подключён")
+    if conn.get("err"): lines.append("⚠️ <i>" + esc(conn["err"]) + "</i>")
+    kb = K(row_width=1)
+    kb.add(B("🔄 Реконнект", callback_data="reconn"))
+    kb.add(B("◀️", callback_data="menu"))
+    send(cid, "\n".join(lines), kb)
+
+def show_chats(cid, refresh=False):
+    if acc is None: send(cid, "❌"); return
+    if refresh or time.time() - cache.get("ts", 0) > 30:
+        cache["chats"] = get_chats(); cache["ts"] = time.time()
+    chats = (cache.get("chats") or [])[:20]
+    kb = K(row_width=1); lines = ["💬 <b>Чаты</b>", ""]
+    if not chats: lines.append("<i>пусто</i>")
+    for ch in chats:
+        c = str(g(ch, "id", "chat_id") or "")
+        n = chat_name(c) or peer_in_chat(ch) or "?"
+        lines.append("• <b>" + esc(n) + "</b>")
+        kb.add(B("💬 " + n[:24], callback_data="c:" + c))
+    kb.row(B("📥 Обновить", callback_data="chats_load"), B("◀️", callback_data="menu"))
+    send(cid, "\n".join(lines), kb)
+
+def show_history(cid, chat_id):
+    if acc is None: send(cid, "❌"); return
+    msgs = get_msgs(chat_id)[-15:]
+    ch = None
+    for c in (cache.get("chats") or []):
+        if str(g(c, "id", "chat_id") or "") == str(chat_id): ch = c; break
+    known = chat_name(chat_id) or peer_in_chat(ch) if ch else chat_name(chat_id)
+    lines = ["💬 <b>" + esc(known or "чат") + "</b>", ""]
+    for m in msgs:
+        if my_msg(m): who = "🟦 Я"
+        else: who = peer_in_message(m, ch) or known or "👤"
+        txt = substitute_templates(mtext(m))
+        if not txt or txt == "None": continue
+        lines.append("<b>" + esc(who) + "</b> <i>" + esc(mts(m)) + "</i>")
+        lines.append(esc(txt[:400])); lines.append("")
+    kb = K(row_width=2)
+    kb.row(B("📜 Обновить", callback_data="c:" + chat_id), B("✍️ Ответ", callback_data="r:" + chat_id))
+    kb.add(B("◀️", callback_data="chats"))
+    send(cid, "\n".join(lines), kb)
+
+def show_deals(cid):
+    deals = list(DEALS_D.values())[-20:]
+    if not deals:
+        send(cid, "📋 <b>Сделок нет</b>", K().add(B("◀️", callback_data="menu"))); return
+    lines = ["📋 <b>Сделки</b>", ""]
+    for d in deals:
+        st = d.get("status", "")
+        em = status_emoji(st)
+        it = d.get("item", "")
+        line = em + " <code>" + esc(d.get("id","")[:16]) + "</code> · " + esc(d.get("buyer","—")) + " · " + str(round(d.get("price",0))) + "₽"
+        if it: line += " · " + esc(it[:30])
+        line += " · " + esc(status_ru(st))
+        lines.append(line)
+    send(cid, "\n".join(lines), K(row_width=1).add(B("◀️", callback_data="menu")))
 
 def show_notify(cid):
     ac = "✅" if SET_D.get("auto_confirm") else "⏸"
@@ -895,20 +983,38 @@ def show_ac_lots(cid):
     kb.add(B("➕ Добавить лот", callback_data="ac_lot_add"))
     kb.add(B("🗑 Очистить (все лоты)", callback_data="ac_lots_clear"))
     kb.add(B("◀️ Назад", callback_data="notify"))
-    txt = (f"📦 <b>Лоты для автоподтверждения</b>\n\n"
-           f"Пусто = подтверждать <b>все</b>.\n"
-           f"Добавленные = фильтр по названию.\n\n"
-           f"Сейчас: <b>{len(lots) if lots else 'все'}</b>")
-    send(cid, txt, kb)
+    send(cid, f"📦 <b>Лоты для автоподтверждения</b>\n\nПусто = все.\nДобавленные = фильтр.\n\nСейчас: <b>{len(lots) if lots else 'все'}</b>", kb)
+
+def show_prof(cid):
+    if acc is None: send(cid, "❌"); return
+    refresh_profile(); d = profile or {}
+    txt = ("👤 <b>Профиль</b>\n\n🆔 <code>" + esc(d.get("id","—")) + "</code>\n👤 <b>" + esc(d.get("username","—")) + "</b>")
+    send(cid, txt, K().add(B("◀️", callback_data="menu")))
+
+def show_set(cid):
+    auto = "✅ вкл" if SET_D.get("auto_update", True) else "❌ выкл"
+    upd = "—"
+    if _update_check.get("ts"):
+        upd = ("🔄 " + _update_check.get("remote","") + " доступна") if _update_check.get("has") else "✅ актуально"
+    lines = ["⚙️ <b>Настройки</b>", "",
+             "🆔 Инстанс: <b>" + esc(INSTANCE_NAME) + "</b>",
+             "📦 Версия: <b>" + esc(BOT_VERSION) + "</b>",
+             "🔄 Автообновление: <b>" + auto + "</b>",
+             "📊 " + upd]
+    kb = K(row_width=1)
+    kb.add(B("🔄 Автообновление " + auto, callback_data="tog:auto_update"))
+    kb.add(B("🔄 Перезапустить", callback_data="restart"))
+    kb.add(B("📄 Лог", callback_data="log"))
+    kb.add(B("◀️", callback_data="menu"))
+    send(cid, "\n".join(lines), kb)
 
 def show_items(cid, off=0):
     if acc is None: send(cid, "❌"); return
     items = get_items()
     kb = K(row_width=1); lines = ["📦 <b>Мои лоты</b>", ""]
     if not items: lines.append("<i>нет лотов</i>")
-    
     confirm_lots = SET_D.get("auto_confirm_lots") or []
-    
+    bump_lots = SET_D.get("auto_bump_lots") or {}
     for it in items[off:off+5]:
         iid = str(g(it, "id", "item_id") or "")
         name = sv(g(it, "name", "title"))
@@ -917,8 +1023,9 @@ def show_items(cid, off=0):
         photos = item_photos(it)
         mark = "🖼" if photos else "·"
         conf_mark = " ⚡" if name in confirm_lots else ""
-        lines.append(mark + " <b>" + esc(name[:40]) + "</b> — " + str(price) + "₽" + conf_mark)
-        kb.add(B("📦 " + name[:20] + " · " + str(price) + "₽" + conf_mark, callback_data="it:" + iid))
+        bump_mark = " 🔁" if (bump_lots.get(iid, {}) or {}).get("enabled") else ""
+        lines.append(mark + " <b>" + esc(name[:40]) + "</b> — " + str(price) + "₽" + conf_mark + bump_mark)
+        kb.add(B("📦 " + name[:20] + " · " + str(price) + "₽" + conf_mark + bump_mark, callback_data="it:" + iid))
     kb.add(B("◀️", callback_data="menu"))
     send(cid, "\n".join(lines), kb)
 
@@ -935,20 +1042,25 @@ def show_item(cid, iid):
     try: price = int(g(it, "price", "amount") or 0)
     except Exception: price = 0
     photos = item_photos(it)
-    
     confirm_lots = SET_D.get("auto_confirm_lots") or []
-    if not SET_D.get("auto_confirm"):
-        confirm_btn = "⚡ Автоподтверждение: ГЛОБАЛЬНО ВЫКЛ"
-    elif not confirm_lots:
-        confirm_btn = "✅ Автоподтверждение: ВСЕ ЛОТЫ"
-    elif name in confirm_lots:
-        confirm_btn = "✅ Автоподтверждение: ВКЛ"
+    if not SET_D.get("auto_confirm"): confirm_btn = "⚡ Автоподтверждение: ВЫКЛ"
+    elif not confirm_lots: confirm_btn = "✅ Автоподтверждение: ВСЕ"
+    elif name in confirm_lots: confirm_btn = "✅ Автоподтверждение: ВКЛ"
+    else: confirm_btn = "⏸ Автоподтверждение: ВЫКЛ"
+    bump_cfg = (SET_D.get("auto_bump_lots") or {}).get(str(iid), {})
+    if bump_cfg.get("enabled"):
+        nxt = bump_cfg.get("next_at", 0)
+        try: nxt_s = datetime.fromtimestamp(nxt).strftime("%H:%M:%S")
+        except Exception: nxt_s = "—"
+        bump_btn = f"✅ Автоподнятие: {fmt_interval(bump_cfg.get('interval_sec', 3600))} · {nxt_s}"
     else:
-        confirm_btn = "⏸ Автоподтверждение: ВЫКЛ"
-
-    lines = ["📦 <b>" + esc(name) + "</b>", "", "💰 Цена: <b>" + str(price) + "₽</b>", "🖼 Фото: <b>" + str(len(photos)) + "</b>", "", "📝 " + esc(desc[:400])]
+        bump_btn = "⏸ Автоподнятие: ВЫКЛ"
+    lines = ["📦 <b>" + esc(name) + "</b>", "", "💰 Цена: <b>" + str(price) + "₽</b>",
+             "🖼 Фото: <b>" + str(len(photos)) + "</b>", "", "📝 " + esc(desc[:400])]
     kb = K(row_width=1)
     kb.add(B(confirm_btn, callback_data=f"tog_confirm_lot:{iid}"))
+    kb.add(B(bump_btn, callback_data=f"bump_menu:{iid}"))
+    kb.add(B("⚡ Поднять сейчас", callback_data=f"bump_now:{iid}"))
     kb.add(B("◀️ Назад", callback_data="items:0"))
     txt = "\n".join(lines)
     if photos:
@@ -958,20 +1070,60 @@ def show_item(cid, iid):
             except Exception: pass
     send(cid, txt, kb)
 
-def show_deals(cid):
-    deals = list(DEALS_D.values())[-20:]
-    if not deals:
-        send(cid, "📋 <b>Сделок нет</b>", K().add(B("◀️", callback_data="menu"))); return
-    lines = ["📋 <b>Сделки</b>", ""]
-    for d in deals:
-        st = d.get("status", "")
-        em = status_emoji(st)
-        it = d.get("item", "")
-        line = em + " <code>" + esc(d.get("id","")[:16]) + "</code> · " + esc(d.get("buyer","—")) + " · " + str(round(d.get("price",0))) + "₽"
-        if it: line += " · " + esc(it[:30])
-        line += " · " + esc(status_ru(st))
-        lines.append(line)
-    send(cid, "\n".join(lines), K(row_width=1).add(B("◀️", callback_data="menu")))
+def show_bump_menu(cid, iid):
+    cfg = (SET_D.get("auto_bump_lots") or {}).get(str(iid), {})
+    enabled = cfg.get("enabled", False)
+    interval = cfg.get("interval_sec", 3600)
+    cnt = cfg.get("count", 0)
+    last_ts = int(cfg.get("last_at", 0))
+    nxt_ts = int(cfg.get("next_at", 0))
+    try: last = datetime.fromtimestamp(last_ts).strftime("%d.%m %H:%M:%S") if last_ts else "—"
+    except Exception: last = "—"
+    try: nxt = datetime.fromtimestamp(nxt_ts).strftime("%d.%m %H:%M:%S") if nxt_ts else "—"
+    except Exception: nxt = "—"
+    lines = ["⚡ <b>Автоподнятие лота</b>", "",
+             "🆔 <code>" + esc(str(iid)[:16]) + "</code>",
+             "📊 Статус: <b>" + ("🟢 ВКЛ" if enabled else "🔴 ВЫКЛ") + "</b>",
+             "⏱ Интервал: <b>" + fmt_interval(interval) + "</b>",
+             "🔢 Поднятий: <b>" + str(cnt) + "</b>",
+             "📅 Последнее: " + last, "⏰ Следующее: " + nxt]
+    if cfg.get("last_error"): lines.append("⚠️ <i>" + esc(str(cfg["last_error"])[:200]) + "</i>")
+    kb = K(row_width=3)
+    for label, sec in [("1 мин",60),("5 мин",300),("15 мин",900),("30 мин",1800),
+                       ("1 час",3600),("3 часа",10800),("6 часов",21600),
+                       ("12 часов",43200),("24 часа",86400)]:
+        mark = "✅ " if int(interval) == sec else ""
+        kb.add(B(mark + label, callback_data=f"bump_int:{iid}:{sec}"))
+    kb.row(B("✍️ Своё значение", callback_data=f"bump_custom:{iid}"))
+    kb.row(B("⏸ Выключить" if enabled else "🟢 Включить", callback_data=f"bump_toggle:{iid}"))
+    kb.row(B("⚡ Поднять сейчас", callback_data=f"bump_now:{iid}"))
+    kb.add(B("◀️ Назад", callback_data=f"it:{iid}"))
+    send(cid, "\n".join(lines), kb)
+
+def show_bump_all(cid):
+    items = get_items()
+    lots = SET_D.get("auto_bump_lots", {}) or {}
+    kb = K(row_width=1)
+    lines = ["⚡ <b>Автоподнятие лотов</b>", ""]
+    if not items: lines.append("<i>нет лотов</i>")
+    active = 0
+    for it in items[:20]:
+        iid = str(g(it, "id", "item_id") or "")
+        name = sv(g(it, "name", "title"))
+        cfg = lots.get(iid, {})
+        if cfg.get("enabled"):
+            mark = "🟢"; active += 1
+            nxt = cfg.get("next_at")
+            try: nxt_s = datetime.fromtimestamp(nxt).strftime("%H:%M") if nxt else "—"
+            except Exception: nxt_s = "—"
+            info = f" {fmt_interval(cfg.get('interval_sec', 3600))} · в {nxt_s}"
+        else:
+            mark = "🔴"; info = ""
+        lines.append(mark + " " + esc(name[:40]) + info)
+        kb.add(B(mark + " " + name[:30], callback_data=f"bump_menu:{iid}"))
+    lines.append(""); lines.append(f"🟢 Активных: <b>{active}</b> из <b>{len(items)}</b>")
+    kb.add(B("◀️ Назад", callback_data="menu"))
+    send(cid, "\n".join(lines), kb)
 
 # ═══════════════════════════════════════════════════════════════
 # CALLBACKS
@@ -986,10 +1138,36 @@ def on_cb(c):
         L.info("CB: %r", a)
         if a in ("menu","status","refresh"):
             _show_main_menu(cid, edit_mid=mid_)
-        elif a == "notify":
-            show_notify(cid)
-        elif a == "ac_lots_menu":
-            show_ac_lots(cid)
+        elif a == "conn": show_conn(cid)
+        elif a == "reconn":
+            send(cid, "🔄 Переподключаюсь...")
+            def _r():
+                global acc
+                acc = None
+                try:
+                    connect(); refresh_profile()
+                    send(cid, "🟢 Подключено: " + esc(sv(g(acc,"username"))))
+                except Exception as e:
+                    send(cid, "❌ " + esc(str(e)[:250]))
+            threading.Thread(target=_r, daemon=True).start()
+        elif a in ("chats","chats_load"): show_chats(cid, True)
+        elif a.startswith("c:"): show_history(cid, a[2:])
+        elif a == "prof": show_prof(cid)
+        elif a == "set": show_set(cid)
+        elif a == "restart":
+            send(cid, "🔄"); time.sleep(1); os.execv(sys.executable, [sys.executable] + sys.argv)
+        elif a == "log":
+            try:
+                with open(LOG_FILE, encoding="utf-8") as f: lines = f.readlines()[-300:]
+                p = os.path.join(INST_DIR, "log_tail.txt")
+                with open(p, "w", encoding="utf-8") as f: f.writelines(lines)
+                with open(p, "rb") as f: bot.send_document(cid, f)
+            except Exception as e: send(cid, "❌ " + esc(str(e)))
+        elif a == "tog:auto_update":
+            SET_D["auto_update"] = not SET_D.get("auto_update", True); save_set(); show_set(cid)
+        elif a == "deals": show_deals(cid)
+        elif a == "notify": show_notify(cid)
+        elif a == "ac_lots_menu": show_ac_lots(cid)
         elif a == "ac_lot_add":
             state[cid] = {"action": "ac_lot_add"}
             bot.send_message(cid, "📦 Отправь часть названия лота для автоподтверждения:\n\n/cancel — отмена")
@@ -997,11 +1175,9 @@ def on_cb(c):
             try: idx = int(a.split(":")[1])
             except Exception: idx = -1
             lots = SET_D.get("auto_confirm_lots") or []
-            if 0 <= idx < len(lots):
-                lots.pop(idx); SET_D["auto_confirm_lots"] = lots; save_set()
+            if 0 <= idx < len(lots): lots.pop(idx); SET_D["auto_confirm_lots"] = lots; save_set()
             show_ac_lots(cid)
-        elif a == "ac_lots_clear":
-            SET_D["auto_confirm_lots"] = []; save_set(); show_ac_lots(cid)
+        elif a == "ac_lots_clear": SET_D["auto_confirm_lots"] = []; save_set(); show_ac_lots(cid)
         elif a == "ac_review_text":
             state[cid] = {"action": "ac_review_text"}
             cur = SET_D.get("auto_confirm_review_text", "")
@@ -1010,16 +1186,11 @@ def on_cb(c):
             state[cid] = {"action": "ac_purchase_text"}
             cur = SET_D.get("auto_reply_purchase_text", "")
             bot.send_message(cid, f"✏️ Отправь новый текст автоответа на покупку.\n\nСейчас: <i>{esc(cur[:200])}</i>\n\n/cancel — отмена")
-        elif a == "tog:notify_messages":
-            SET_D["notify_messages"] = not SET_D.get("notify_messages"); save_set(); show_notify(cid)
-        elif a == "tog:notify_deals":
-            SET_D["notify_deals"] = not SET_D.get("notify_deals"); save_set(); show_notify(cid)
-        elif a == "tog:auto_confirm":
-            SET_D["auto_confirm"] = not SET_D.get("auto_confirm"); save_set(); show_notify(cid)
-        elif a == "tog:auto_confirm_reviews":
-            SET_D["auto_confirm_reviews"] = not SET_D.get("auto_confirm_reviews"); save_set(); show_notify(cid)
-        elif a == "tog:auto_reply_purchase":
-            SET_D["auto_reply_purchase"] = not SET_D.get("auto_reply_purchase", True); save_set(); show_notify(cid)
+        elif a == "tog:notify_messages": SET_D["notify_messages"] = not SET_D.get("notify_messages"); save_set(); show_notify(cid)
+        elif a == "tog:notify_deals": SET_D["notify_deals"] = not SET_D.get("notify_deals"); save_set(); show_notify(cid)
+        elif a == "tog:auto_confirm": SET_D["auto_confirm"] = not SET_D.get("auto_confirm"); save_set(); show_notify(cid)
+        elif a == "tog:auto_confirm_reviews": SET_D["auto_confirm_reviews"] = not SET_D.get("auto_confirm_reviews"); save_set(); show_notify(cid)
+        elif a == "tog:auto_reply_purchase": SET_D["auto_reply_purchase"] = not SET_D.get("auto_reply_purchase", True); save_set(); show_notify(cid)
         elif a.startswith("cyc:auto_confirm_delay"):
             cur = int(SET_D.get("auto_confirm_delay", 30) or 30)
             nxt = {10:30, 30:60, 60:120, 120:300, 300:10}.get(cur, 30)
@@ -1050,44 +1221,81 @@ def on_cb(c):
                     except Exception: pass
                 save_set()
             show_item(cid, iid)
-        elif a == "deals": show_deals(cid)
+        # ═══ АВТОПОДНЯТИЕ ═══
+        elif a == "bump_all": show_bump_all(cid)
+        elif a.startswith("bump_menu:"): show_bump_menu(cid, a.split(":", 1)[1])
+        elif a.startswith("bump_toggle:"):
+            iid = a.split(":", 1)[1]
+            lots = SET_D.setdefault("auto_bump_lots", {})
+            cur = lots.get(str(iid), {})
+            cur["enabled"] = not cur.get("enabled", False)
+            if "interval_sec" not in cur: cur["interval_sec"] = 3600
+            if cur["enabled"]: cur["next_at"] = int(time.time() + cur["interval_sec"])
+            lots[str(iid)] = cur; SET_D["auto_bump_lots"] = lots; save_set()
+            show_bump_menu(cid, iid)
+        elif a.startswith("bump_int:"):
+            try: _, iid, sec = a.split(":")
+            except ValueError: return
+            lots = SET_D.setdefault("auto_bump_lots", {})
+            cur = lots.get(str(iid), {})
+            cur["interval_sec"] = int(sec)
+            if cur.get("enabled"): cur["next_at"] = int(time.time() + int(sec))
+            cur.setdefault("enabled", False)
+            lots[str(iid)] = cur; SET_D["auto_bump_lots"] = lots; save_set()
+            show_bump_menu(cid, iid)
+        elif a.startswith("bump_custom:"):
+            iid = a.split(":", 1)[1]
+            state[cid] = {"action": "bump_custom", "iid": iid}
+            bot.send_message(cid, "✍️ Введи интервал автоподнятия.\n\nПримеры:\n<code>5м</code>, <code>2ч</code>, <code>1д</code>, <code>90</code>\n\n/cancel — отмена")
+        elif a.startswith("bump_now:"):
+            iid = a.split(":", 1)[1]
+            send(cid, "⚡ Поднимаю...")
+            def _bn(iid_=iid):
+                ok, err = bump_lot_now(iid_, silent=False)
+                if ok:
+                    lots = SET_D.setdefault("auto_bump_lots", {})
+                    cur = lots.get(str(iid_), {})
+                    if cur.get("enabled"):
+                        cur["next_at"] = int(time.time() + int(cur.get("interval_sec", 3600)))
+                        cur["last_at"] = int(time.time())
+                        cur["count"] = int(cur.get("count", 0)) + 1
+                        lots[str(iid_)] = cur; SET_D["auto_bump_lots"] = lots; save_set()
+                    try: show_bump_menu(cid, iid_)
+                    except Exception: pass
+                else: send(cid, "❌ " + esc(str(err)))
+            threading.Thread(target=_bn, daemon=True).start()
         else: L.warning("CB unhandled: %r", a)
     except Exception as e:
         L.exception("cb error: %s", e)
 
 # ═══════════════════════════════════════════════════════════════
-# COMMANDS (ВАЖНО: ДО handle_text!)
+# COMMANDS (ДО handle_text!)
 # ═══════════════════════════════════════════════════════════════
 @bot.message_handler(commands=["start","menu"])
 def cmd_start(m):
     L.info("CMD /start from %s", m.chat.id)
     if not adm(m):
         L.warning("cmd_start: not authorized")
-        bot.reply_to(m, "⛔ Нет доступа")
-        return
+        bot.reply_to(m, "⛔ Нет доступа"); return
     state.pop(m.chat.id, None)
     _show_main_menu(m.chat.id)
 
 @bot.message_handler(commands=["id"])
-def cmd_id(m):
-    bot.reply_to(m, f"🆔 <code>{m.chat.id}</code>")
+def cmd_id(m): bot.reply_to(m, f"🆔 <code>{m.chat.id}</code>")
 
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel(m):
-    state.pop(m.chat.id, None)
-    bot.reply_to(m, "❌ Отменено")
+    state.pop(m.chat.id, None); bot.reply_to(m, "❌ Отменено")
 
 # ═══════════════════════════════════════════════════════════════
-# TEXT
+# TEXT (только если не команда)
 # ═══════════════════════════════════════════════════════════════
 @bot.message_handler(content_types=["text"])
 def handle_text(m):
-    if (m.text or "").startswith("/"):
-        return
+    if (m.text or "").startswith("/"): return
     uid = int(m.chat.id) if m.chat.id else 0
     if not is_authorized(uid):
         bot.reply_to(m, "🔐 Введи пароль:"); return
-
     st = state.get(m.chat.id)
     a = st.get("action") if isinstance(st, dict) else st
     if not a: return
@@ -1097,25 +1305,30 @@ def handle_text(m):
         t = (m.text or "").strip()
         if t:
             lots = SET_D.setdefault("auto_confirm_lots", [])
-            if t not in lots:
-                lots.append(t); save_set()
-                bot.reply_to(m, f"✅ Добавлено в фильтр: <code>{esc(t)}</code>")
-            else: bot.reply_to(m, "❌ Такой лот уже в списке")
+            if t not in lots: lots.append(t); save_set(); bot.reply_to(m, f"✅ Добавлено: <code>{esc(t)}</code>")
+            else: bot.reply_to(m, "❌ Уже есть")
         show_ac_lots(m.chat.id)
     elif a == "ac_review_text":
-        state.pop(m.chat.id, None)
-        t = (m.text or "").strip()
-        if t:
-            SET_D["auto_confirm_review_text"] = t; save_set()
-            bot.reply_to(m, f"✅ Текст отзыва сохранён ({len(t)} симв.)")
+        state.pop(m.chat.id, None); t = (m.text or "").strip()
+        if t: SET_D["auto_confirm_review_text"] = t; save_set(); bot.reply_to(m, f"✅ Сохранено ({len(t)} симв.)")
         show_notify(m.chat.id)
     elif a == "ac_purchase_text":
-        state.pop(m.chat.id, None)
-        t = (m.text or "").strip()
-        if t:
-            SET_D["auto_reply_purchase_text"] = t; save_set()
-            bot.reply_to(m, f"✅ Текст покупки сохранён ({len(t)} симв.)")
+        state.pop(m.chat.id, None); t = (m.text or "").strip()
+        if t: SET_D["auto_reply_purchase_text"] = t; save_set(); bot.reply_to(m, f"✅ Сохранено ({len(t)} симв.)")
         show_notify(m.chat.id)
+    elif a == "bump_custom":
+        state.pop(m.chat.id, None); iid = st.get("iid")
+        sec = parse_interval((m.text or "").strip())
+        if not sec:
+            bot.reply_to(m, "❌ Не понял. Примеры: 5м, 2ч, 1д, 90"); return
+        lots = SET_D.setdefault("auto_bump_lots", {})
+        cur = lots.get(str(iid), {})
+        cur["interval_sec"] = int(sec)
+        if cur.get("enabled"): cur["next_at"] = int(time.time() + int(sec))
+        cur.setdefault("enabled", False)
+        lots[str(iid)] = cur; SET_D["auto_bump_lots"] = lots; save_set()
+        bot.reply_to(m, f"✅ Интервал: {fmt_interval(sec)}")
+        show_bump_menu(m.chat.id, iid)
 
 def main():
     L.info("=== Playerok Bot v" + BOT_VERSION + " · instance: " + INSTANCE_NAME + " ===")
@@ -1123,6 +1336,7 @@ def main():
         try:
             connect()
             threading.Thread(target=poller, name="poll", daemon=True).start()
+            start_bump_worker()
             refresh_profile()
         except Exception as e: L.error("startup: %s", e)
     try: notif("🚀 <b>" + INSTANCE_NAME + "</b> v" + BOT_VERSION + " (pid " + str(os.getpid()) + ")")
